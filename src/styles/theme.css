@@ -1,0 +1,108 @@
+/* =========================
+   DARK MODE (DEFAULT)
+   ========================= */
+
+:root {
+  --bg-gradient-start: #1a0033; /* deep violet */
+  --bg-gradient-end: #29004d;
+
+  --card-bg: rgba(30, 30, 46, 0.65);
+  --card-border: rgba(255,255,255,0.08);
+
+  --button-primary: #4b4ded;
+  --button-secondary: #3b3b55;
+
+  --yes: #2ecc71;
+  --no: #e74c3c;
+
+  --text: white;
+  --secondary-text: #c7c7d9;
+
+  --progress-bg: rgba(255,255,255,0.1);
+}
+
+
+/* =========================
+   LIGHT MODE
+   ========================= */
+
+.light-mode {
+  --bg-gradient-start: #e0e0e0;
+  --bg-gradient-end: #cfcfcf;
+
+  --card-bg: rgba(255,255,255,0.75);
+  --card-border: rgba(0,0,0,0.08);
+
+  --button-primary: #5b5bff;
+  --button-secondary: #9a9ab5;
+
+  --text: black;
+  --secondary-text: #555;
+
+  --progress-bg: rgba(0,0,0,0.08);
+}
+
+
+/* =========================
+   GLOBAL BODY STYLE
+   ========================= */
+
+body {
+  margin: 0;
+  font-family: Inter, Arial, sans-serif;
+
+  background: linear-gradient(
+    135deg,
+    var(--bg-gradient-start),
+    var(--bg-gradient-end)
+  );
+
+  color: var(--text);
+
+  min-height: 100vh;
+
+  transition:
+    background 0.5s ease,
+    color 0.3s ease;
+}
+
+
+/* =========================
+   GLASS CARD STYLE
+   ========================= */
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  backdrop-filter: blur(8px);
+  border-radius: 12px;
+}
+
+
+/* =========================
+   BUTTON IMPROVEMENTS
+   ========================= */
+
+button {
+  transition:
+    transform 0.15s ease,
+    opacity 0.2s ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+  opacity: 0.9;
+}
+
+button:active {
+  transform: translateY(0px) scale(0.98);
+}
+
+
+/* =========================
+   PROGRESS BAR BASE
+   ========================= */
+
+.progress-bg {
+  background: var(--progress-bg);
+}
