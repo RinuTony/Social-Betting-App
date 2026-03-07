@@ -2,7 +2,7 @@ import React from 'react';
 import { Text, View, StyleSheet, Pressable } from 'react-native';
 
 export default function TopNav({ current, onChange }) {
-  const tabs = ['Feed', 'Wallet', 'Rewards'];
+  const tabs = ['Feed', 'Social', 'Wallet', 'Rewards'];
 
   return (
     <View style={styles.row}>

@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "Social Betting App",
-    "slug": "social-betting-app",
+    "name": "Bet On Me",
+    "slug": "bet-on-me",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",

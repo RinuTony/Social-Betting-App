@@ -51,12 +51,12 @@ export function autoSeedFriendBets(promiseObj, friendIds) {
 
 export function placeBet(promiseObj, bettorId, side, amount) {
   if (promiseObj.status !== 'OPEN') {
-    return { ok: false, error: 'Bets are closed for this promise.' };
+    return { ok: false, error: 'Bets are closed for this bet.' };
   }
 
   const exists = promiseObj.bets.some((b) => b.bettorId === bettorId);
   if (exists) {
-    return { ok: false, error: 'You already placed a bet on this promise.' };
+    return { ok: false, error: 'You already placed a bet on this bet.' };
   }
 
   const next = {
