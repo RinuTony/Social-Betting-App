@@ -8,6 +8,7 @@ A social prediction platform where friends place virtual-coin bets on whether yo
 - Bet ownership tied to authenticated Firebase `uid`.
 - Wallet balance tied to authenticated Firebase `uid`.
 - Create bets with deadlines.
+- Calendar/date-time picker for bet deadlines.
 - Multi-user predictions stored in Firestore subcollections.
 - Pool updates in real time via Firestore listeners.
 - Submit proof for completed bets.
@@ -20,6 +21,21 @@ A social prediction platform where friends place virtual-coin bets on whether yo
   - Optional proof image picker (`expo-image-picker`)
   - Gemini-based verdict (`PASS`/`FAIL`) + reason + confidence
   - Automatic fallback to mock AI when Gemini key/model is not set or request fails
+- Generative proof enhancement:
+  - Turns proof photo into a shareable "MISSION ACCOMPLISHED" victory poster
+  - Uses Gemini image generation with fallback to original proof photo
+  - Stores poster on each settled bet for in-feed preview and sharing
+- AI behavior insights:
+  - History-based odds prediction per user (PASS probability)
+  - AI-generated recap text per user in Social tab
+- Intelligent social betting (MVP):
+  - AI bet synthesis: rewrites raw goals into clearer, verifiable bet wording
+  - True odds + risk label from last 10 settled bets
+  - AI Bookie opening commentary on every new bet
+  - Liveness challenge: secret gesture + 3-second video required for proof
+  - AI dispute evidence summary generated when disputes are raised
+  - Predictive nudge near deadline for the bet owner
+  - Owner staking multiplier on successful completion
 - Trust/safety flow:
   - Proof deadline enforcement
   - One proof submission per bet
@@ -61,6 +77,7 @@ Required env vars:
 - `EXPO_PUBLIC_FIREBASE_APP_ID`
 - `EXPO_PUBLIC_GEMINI_API_KEY` (optional for real Gemini AI)
 - `EXPO_PUBLIC_GEMINI_MODEL` (optional, default `gemini-1.5-flash`)
+- `EXPO_PUBLIC_GEMINI_IMAGE_MODEL` (optional, image model for poster generation)
 
 ## Firestore Collections
 
@@ -73,7 +90,7 @@ Required env vars:
 - `users/{uid}/notifications/{notificationId}`
   - `type`, `title`, `body`, `betId?`, `createdAt`, `createdAtMs`
 - `bets/{betId}`
-  - `ownerId`, `ownerName`, `actorId`, `text`, `deadlineISO`, `status`, `aiVerdict`, `aiReason`, `aiConfidence`, `aiProvider`, `reviewStatus`, `proofNote`, `proofImageUri`, `proofDeadlineAtMs`, `proofSubmittedAtMs`, `disputeWindowEndsAtMs`, `poolYes`, `poolNo`, `poolTotal`, `predictorCount`, `createdAtISO`, `createdAtMs`, `updatedAt`
+  - `ownerId`, `ownerName`, `actorId`, `text`, `deadlineISO`, `status`, `aiVerdict`, `aiReason`, `aiConfidence`, `aiProvider`, `reviewStatus`, `proofNote`, `proofImageUri`, `proofVideoUri`, `secretGesture`, `trueOdds`, `riskLabel`, `aiBookieComment`, `aiDisputeSummary`, `aiDisputeProvider`, `ownerStake`, `ownerStakeMultiplier`, `nudgeSentAtMs`, `victoryPosterUri`, `victoryPosterStyle`, `victoryPosterProvider`, `victoryPosterError`, `proofDeadlineAtMs`, `proofSubmittedAtMs`, `disputeWindowEndsAtMs`, `poolYes`, `poolNo`, `poolTotal`, `predictorCount`, `createdAtISO`, `createdAtMs`, `updatedAt`
 - `bets/{betId}/predictions/{uid}`
   - `userId`, `userName`, `side`, `amount`, `createdAt`, `createdAtMs`
 - `bets/{betId}/disputes/{uid}`
@@ -89,47 +106,59 @@ Required env vars:
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read, write: if signedIn() && request.auth.uid == userId;
 
       match /friends/{friendId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
+        allow read: if signedIn() && (request.auth.uid == userId || request.auth.uid == friendId);
+        allow create, update, delete: if signedIn() && (request.auth.uid == userId || request.auth.uid == friendId);
       }
 
       match /incoming_requests/{requestId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
+        allow read, delete: if signedIn() && request.auth.uid == userId;
+        allow create: if signedIn()
+          && request.auth.uid == requestId
+          && request.auth.uid != userId
+          && request.resource.data.fromUserId == request.auth.uid;
+        allow update: if signedIn() && request.auth.uid == userId;
       }
 
       match /notifications/{notificationId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
+        allow read, delete: if signedIn() && request.auth.uid == userId;
+        allow create: if signedIn()
+          && request.resource.data.actorId == request.auth.uid;
       }
     }
 
     match /bets/{betId} {
-      allow read: if request.auth != null;
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.ownerId;
-      allow update, delete: if request.auth != null && request.auth.uid == resource.data.ownerId;
+      allow read: if signedIn();
+      allow create: if signedIn() && request.auth.uid == request.resource.data.ownerId;
+      allow update, delete: if signedIn() && request.auth.uid == resource.data.ownerId;
 
       match /predictions/{predictionUserId} {
-        allow read: if request.auth != null;
-        allow create: if request.auth != null && request.auth.uid == predictionUserId;
-        allow update, delete: if request.auth != null && request.auth.uid == predictionUserId;
+        allow read: if signedIn();
+        allow create: if signedIn() && request.auth.uid == predictionUserId;
+        allow update, delete: if signedIn() && request.auth.uid == predictionUserId;
       }
 
       match /disputes/{disputeUserId} {
-        allow read: if request.auth != null;
-        allow create: if request.auth != null && request.auth.uid == disputeUserId;
-        allow update, delete: if request.auth != null && request.auth.uid == disputeUserId;
+        allow read: if signedIn();
+        allow create: if signedIn() && request.auth.uid == disputeUserId;
+        allow update, delete: if signedIn() && request.auth.uid == disputeUserId;
       }
 
       match /comments/{commentId} {
-        allow read: if request.auth != null;
-        allow create: if request.auth != null;
+        allow read: if signedIn();
+        allow create: if signedIn();
       }
 
       match /reactions/{reactionUserId} {
-        allow read: if request.auth != null;
-        allow create, update, delete: if request.auth != null && request.auth.uid == reactionUserId;
+        allow read: if signedIn();
+        allow create, update, delete: if signedIn() && request.auth.uid == reactionUserId;
       }
     }
   }

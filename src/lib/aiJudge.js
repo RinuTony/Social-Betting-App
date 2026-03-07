@@ -5,6 +5,7 @@ function buildPrompt({ note, betText, deadlineISO }) {
   return [
     'You are a strict proof verifier for a social accountability app.',
     'Decide if the proof supports the claimed completion for the specific bet.',
+    'Run anti-cheat checks conceptually: OCR hints (clock/text), time-of-day consistency, and location plausibility from visible landmarks.',
     `Bet statement: ${betText || 'Not provided'}`,
     `Bet deadline: ${deadlineISO || 'Not provided'}`,
     'Return JSON only: {"verdict":"PASS|FAIL","reason":"...","confidence":0..1}.',
@@ -39,7 +40,7 @@ async function imageToBase64(uri) {
   }
 }
 
-export async function judgeProof({ note, imageUri, betText, deadlineISO }) {
+export async function judgeProof({ note, imageUri, videoUri, secretGesture, betText, deadlineISO }) {
   const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
   const model = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
 
@@ -54,6 +55,16 @@ export async function judgeProof({ note, imageUri, betText, deadlineISO }) {
   }
 
   const parts = [{ text: buildPrompt({ note, betText, deadlineISO }) }];
+  if (secretGesture) {
+    parts.push({
+      text: `Liveness challenge required: ${secretGesture}. Confirm if provided evidence likely includes this challenge.`,
+    });
+  }
+  if (videoUri) {
+    parts.push({
+      text: 'A short liveness video was provided by the user. Consider it in the verdict.',
+    });
+  }
   const imageBase64 = await imageToBase64(imageUri);
   if (imageBase64) {
     parts.unshift({
