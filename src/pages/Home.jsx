@@ -3,372 +3,237 @@ import { useState, useEffect } from "react";
 import logo from "../assets/logo.jpeg";
 
 function Home() {
-
   const [coins] = useState(100);
   const [darkMode, setDarkMode] = useState(true);
+  const [myBets, setMyBets] = useState([]);
 
-  const myBets = [
-    { id: 1, question: "Complete gym workout today", proofUploaded: false },
-    { id: 2, question: "Wake up before 6 AM tomorrow", proofUploaded: true }
-  ];
-
+  // Mock community data
   const communityBets = [
-    { id: 3, question: "Alex will run 5km today", yes: 60, no: 40 },
-    { id: 4, question: "Sam will finish the project tonight", yes: 35, no: 65 }
+    { id: 101, question: "Alex will run 5km today", yes: 60, no: 40, creator: "Alex" },
+    { id: 102, question: "Sam will finish the project tonight", yes: 35, no: 65, creator: "Sam" }
   ];
 
   useEffect(() => {
-    document.body.style.opacity = 0;
+    // 1. Fetch bets from LocalStorage + add some default mocks if empty
+    const savedBets = JSON.parse(localStorage.getItem("myBets") || "[]");
+    
+    // If no bets exist yet, we can show one hardcoded example
+    const defaultMocks = [
+      { id: 1, question: "Complete gym workout today", proofUploaded: false, participants: 12, isMock: true },
+    ];
 
-    setTimeout(() => {
-      document.body.classList.toggle("light-mode", !darkMode);
-      document.body.style.opacity = 1;
-    }, 200);
+    setMyBets(savedBets.length > 0 ? savedBets : defaultMocks);
 
+    // 2. Apply theme-specific CSS variables
+    const root = document.documentElement;
+    if (darkMode) {
+      root.style.setProperty('--bg-gradient', 'linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%)');
+      root.style.setProperty('--card-bg', 'rgba(255, 255, 255, 0.07)');
+      root.style.setProperty('--text-main', '#ffffff');
+      root.style.setProperty('--text-dim', '#94a3b8');
+    } else {
+      root.style.setProperty('--bg-gradient', 'linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%)');
+      root.style.setProperty('--card-bg', 'rgba(0, 0, 0, 0.03)');
+      root.style.setProperty('--text-main', '#1e293b');
+      root.style.setProperty('--text-dim', '#64748b');
+    }
   }, [darkMode]);
 
-  const uploadProof = (id) => {
-    alert("Proof uploaded for bet " + id);
-  };
-
-  const vote = (id, choice) => {
-    alert(`Vote recorded: ${choice}`);
+  const deleteBet = (id) => {
+    const updated = myBets.filter(bet => bet.id !== id);
+    setMyBets(updated);
+    localStorage.setItem("myBets", JSON.stringify(updated));
   };
 
   return (
-    <div style={styles.container}>
+    <div style={styles.pageWrapper}>
+      <div style={styles.container}>
+        
+        {/* HEADER */}
+        <header style={styles.header}>
+          <div style={styles.titleContainer}>
+            <img src={logo} alt="Logo" style={styles.logo}/>
+            <h1 style={styles.title}>Bet On Me</h1>
+          </div>
 
-      {/* HEADER */}
+          <div style={styles.headerRight}>
+            <div style={styles.coinBadge}>
+              <span style={{marginRight: '5px'}}>💰</span>
+              {coins} <span style={{fontSize: '10px', marginLeft: '4px'}}>COINS</span>
+            </div>
+            <button style={styles.toggle} onClick={() => setDarkMode(!darkMode)}>
+              {darkMode ? "☀️ Light" : "🌙 Dark"}
+            </button>
+          </div>
+        </header>
 
-      <div style={styles.header}>
-
-        <div style={styles.titleContainer}>
-          <img src={logo} alt="Bet On Me Logo" style={styles.logo}/>
-          <h1 style={styles.title}>Bet On Me</h1>
+        {/* HERO / NAV SECTION */}
+        <div style={styles.heroSection}>
+          <h2 style={{fontSize: '32px', marginBottom: '10px'}}>Will you do it?</h2>
+          <p style={{color: 'var(--text-dim)', marginBottom: '20px'}}>Put your reputation on the line.</p>
+          <div style={styles.nav}>
+            <Link to="/create"><button style={styles.primaryBtn}>+ Create New Bet</button></Link>
+            <Link to="/leaderboard"><button style={styles.glassBtn}>🏆 Leaderboard</button></Link>
+          </div>
         </div>
 
-        <div style={styles.headerRight}>
-
-          <span style={styles.coins}>{coins} Coins</span>
-
-          <button
-            style={styles.toggle}
-            onClick={() => setDarkMode(!darkMode)}
-          >
-            {darkMode ? "Light Mode" : "Dark Mode"}
-          </button>
-
-        </div>
-
-      </div>
-
-      {/* NAVIGATION */}
-
-      <div style={styles.nav}>
-
-        <Link to="/create">
-          <button style={styles.primaryBtn}>
-            Create Bet
-          </button>
-        </Link>
-
-        <Link to="/leaderboard">
-          <button style={styles.secondaryBtn}>
-            Leaderboard
-          </button>
-        </Link>
-
-      </div>
-
-      {/* MY BETS */}
-
-      <h2 style={styles.section}>My Bets</h2>
-
-      <div style={styles.grid}>
-
-        {myBets.map((bet) => (
-
-          <div key={bet.id} style={styles.card}>
-
-            <h3>{bet.question}</h3>
-
-            <div style={styles.actions}>
-
-              {!bet.proofUploaded ? (
-                <button
-                  style={styles.primaryBtn}
-                  onClick={() => uploadProof(bet.id)}
-                >
-                  Upload Proof
-                </button>
-              ) : (
-                <span style={styles.completed}>
-                  Proof Submitted
-                </span>
+        {/* SECTIONS */}
+        <div style={styles.mainContent}>
+          <section>
+            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+                <h3 style={styles.sectionTitle}>My Active Stakes</h3>
+                {myBets.length > 0 && <small style={{color: 'var(--text-dim)'}}>{myBets.length} Active</small>}
+            </div>
+            
+            <div style={styles.grid}>
+              {myBets.length > 0 ? myBets.map((bet) => (
+                <div key={bet.id} style={styles.glassCard}>
+                  <div style={styles.cardHeader}>
+                    <span style={styles.tag}>PERSONAL</span>
+                    <button 
+                        onClick={() => deleteBet(bet.id)}
+                        style={{background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', fontSize: '12px'}}
+                    >
+                        Delete
+                    </button>
+                  </div>
+                  <h4 style={styles.betQuestion}>{bet.question}</h4>
+                  <div style={styles.actions}>
+                    {!bet.proofUploaded ? (
+                      <button style={styles.actionBtn} onClick={() => alert("Upload Proof Mock")}>Verify Success</button>
+                    ) : (
+                      <span style={styles.statusBadge}>✅ Pending Review</span>
+                    )}
+                  </div>
+                </div>
+              )) : (
+                <p style={{color: 'var(--text-dim)', fontStyle: 'italic'}}>No active bets. Start a challenge!</p>
               )}
-
-              <Link to={`/bet/${bet.id}`}>
-                <button style={styles.secondaryBtn}>
-                  View
-                </button>
-              </Link>
-
             </div>
+          </section>
 
-          </div>
+          <section style={{marginTop: '50px'}}>
+            <h3 style={styles.sectionTitle}>Friends' Activities</h3>
+            <div style={styles.grid}>
+              {communityBets.map((bet) => (
+                <div key={bet.id} style={styles.glassCard}>
+                  <div style={styles.cardHeader}>
+                    <span style={{...styles.tag, background: '#8b5cf6'}}>{bet.creator}</span>
+                  </div>
+                  <h4 style={styles.betQuestion}>{bet.question}</h4>
+                  
+                  <div style={styles.progressWrapper}>
+                    <div style={styles.progressBarContainer}>
+                      <div style={{...styles.progressFill, width: `${bet.yes}%`, background: '#22c55e'}} />
+                    </div>
+                    <div style={styles.percentLabels}>
+                      <span>{bet.yes}% Yes</span>
+                      <span>{bet.no}% No</span>
+                    </div>
+                  </div>
 
-        ))}
-
+                  <div style={styles.voteRow}>
+                    <button style={styles.voteBtnYes} onClick={() => alert("Betting Yes!")}>Predict Yes</button>
+                    <button style={styles.voteBtnNo} onClick={() => alert("Betting No!")}>No Way</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
       </div>
-
-      {/* COMMUNITY BETS */}
-
-      <h2 style={styles.section}>Community Bets</h2>
-
-      <div style={styles.grid}>
-
-        {communityBets.map((bet) => (
-
-          <div key={bet.id} style={styles.card}>
-
-            <h3>{bet.question}</h3>
-
-            {/* Vote Percentage Bars */}
-
-            <div style={styles.progressContainer}>
-
-              <div style={styles.progressBar}>
-
-                <div
-                  style={{
-                    ...styles.yesBar,
-                    width: `${bet.yes}%`
-                  }}
-                />
-
-                <div
-                  style={{
-                    ...styles.noBar,
-                    width: `${bet.no}%`
-                  }}
-                />
-
-              </div>
-
-              <div style={styles.percentLabels}>
-                <span>{bet.yes}% Yes</span>
-                <span>{bet.no}% No</span>
-              </div>
-
-            </div>
-
-            <div style={styles.voteRow}>
-
-              <div style={styles.voteButtons}>
-
-                <button
-                  style={styles.yesBtn}
-                  onClick={() => vote(bet.id, "YES")}
-                >
-                  Yes
-                </button>
-
-                <button
-                  style={styles.noBtn}
-                  onClick={() => vote(bet.id, "NO")}
-                >
-                  No
-                </button>
-
-              </div>
-
-              <Link to={`/bet/${bet.id}`}>
-                <button style={styles.secondaryBtn}>
-                  Details
-                </button>
-              </Link>
-
-            </div>
-
-          </div>
-
-        ))}
-
-      </div>
-
     </div>
   );
 }
 
-export default Home;
-
 const styles = {
-
-container:{
-maxWidth:"1100px",
-margin:"auto",
-padding:"40px",
-transition:"color 0.3s ease"
-},
-
-header:{
-display:"flex",
-justifyContent:"space-between",
-alignItems:"center",
-paddingBottom:"10px"
-},
-
-titleContainer:{
-display:"flex",
-alignItems:"center",
-gap:"10px"
-},
-
-logo:{
-width:"36px",
-height:"36px",
-objectFit:"contain"
-},
-
-title:{
-margin:0,
-fontSize:"28px",
-fontWeight:"800",
-letterSpacing:"0.5px"
-},
-
-headerRight:{
-display:"flex",
-gap:"15px",
-alignItems:"center"
-},
-
-coins:{
-color:"var(--secondary-text)",
-fontWeight:"600"
-},
-
-toggle:{
-padding:"8px 14px",
-border:"none",
-borderRadius:"6px",
-background:"var(--button-secondary)",
-color:"white",
-cursor:"pointer"
-},
-
-nav:{
-marginTop:"25px",
-display:"flex",
-gap:"15px"
-},
-
-primaryBtn:{
-padding:"10px 18px",
-border:"none",
-borderRadius:"6px",
-background:"var(--button-primary)",
-color:"white",
-cursor:"pointer"
-},
-
-secondaryBtn:{
-padding:"10px 18px",
-border:"none",
-borderRadius:"6px",
-background:"var(--button-secondary)",
-color:"white",
-cursor:"pointer"
-},
-
-section:{
-marginTop:"40px"
-},
-
-grid:{
-display:"grid",
-gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",
-gap:"20px",
-marginTop:"15px"
-},
-
-card:{
-background:"linear-gradient(145deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02))",
-backdropFilter:"blur(8px)",
-padding:"20px",
-borderRadius:"12px",
-boxShadow:"0 8px 30px rgba(0,0,0,0.35)",
-transition:"transform 0.2s ease"
-},
-
-actions:{
-display:"flex",
-justifyContent:"space-between",
-alignItems:"center",
-marginTop:"12px"
-},
-
-voteRow:{
-display:"flex",
-justifyContent:"space-between",
-alignItems:"center",
-marginTop:"14px"
-},
-
-voteButtons:{
-display:"flex",
-gap:"10px"
-},
-
-completed:{
-color:"var(--yes)",
-fontWeight:"600"
-},
-
-yesBtn:{
-padding:"8px 14px",
-background:"var(--yes)",
-border:"none",
-borderRadius:"6px",
-color:"white",
-cursor:"pointer"
-},
-
-noBtn:{
-padding:"8px 14px",
-background:"var(--no)",
-border:"none",
-borderRadius:"6px",
-color:"white",
-cursor:"pointer"
-},
-
-progressContainer:{
-marginTop:"12px"
-},
-
-progressBar:{
-height:"10px",
-display:"flex",
-borderRadius:"6px",
-overflow:"hidden",
-background:"rgba(255,255,255,0.1)"
-},
-
-yesBar:{
-background:"var(--yes)"
-},
-
-noBar:{
-background:"var(--no)"
-},
-
-percentLabels:{
-display:"flex",
-justifyContent:"space-between",
-fontSize:"12px",
-marginTop:"4px",
-color:"var(--secondary-text)"
-}
-
+  pageWrapper: {
+    minHeight: "100vh",
+    background: "var(--bg-gradient)",
+    color: "var(--text-main)",
+    transition: "all 0.4s ease",
+    fontFamily: "'Inter', sans-serif"
+  },
+  container: {
+    maxWidth: "1100px",
+    margin: "auto",
+    padding: "20px 40px",
+  },
+  header: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "20px 0",
+  },
+  titleContainer: { display: "flex", alignItems: "center", gap: "12px" },
+  logo: { width: "40px", height: "40px", borderRadius: "10px", objectFit: 'cover' },
+  title: { fontSize: "24px", fontWeight: "800", margin: 0 },
+  headerRight: { display: "flex", gap: "15px", alignItems: "center" },
+  coinBadge: {
+    background: "rgba(255, 215, 0, 0.15)",
+    padding: "8px 15px",
+    borderRadius: "20px",
+    border: "1px solid rgba(255, 215, 0, 0.3)",
+    fontWeight: "bold",
+    color: "#fbbf24"
+  },
+  toggle: {
+    background: "var(--card-bg)",
+    border: "1px solid rgba(255,255,255,0.1)",
+    color: "inherit",
+    padding: "8px 12px",
+    borderRadius: "10px",
+    cursor: "pointer"
+  },
+  heroSection: { padding: "60px 0", textAlign: "left" },
+  nav: { display: "flex", gap: "15px" },
+  primaryBtn: {
+    background: "#6366f1",
+    color: "white",
+    border: "none",
+    padding: "12px 24px",
+    borderRadius: "12px",
+    fontWeight: "600",
+    cursor: "pointer",
+    boxShadow: "0 4px 15px rgba(99, 102, 241, 0.4)"
+  },
+  glassBtn: {
+    background: "var(--card-bg)",
+    backdropFilter: "blur(10px)",
+    color: "var(--text-main)",
+    border: "1px solid rgba(255,255,255,0.1)",
+    padding: "12px 24px",
+    borderRadius: "12px",
+    cursor: "pointer"
+  },
+  sectionTitle: { fontSize: "20px", fontWeight: "700", marginBottom: "20px", opacity: 0.9 },
+  grid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
+    gap: "25px"
+  },
+  glassCard: {
+    background: "var(--card-bg)",
+    backdropFilter: "blur(12px)",
+    WebkitBackdropFilter: "blur(12px)",
+    borderRadius: "20px",
+    padding: "24px",
+    border: "1px solid rgba(255,255,255,0.1)",
+    boxShadow: "0 10px 30px rgba(0,0,0,0.1)",
+    transition: "transform 0.3s ease",
+  },
+  cardHeader: { display: "flex", justifyContent: "space-between", marginBottom: "15px", alignItems: 'center' },
+  tag: { fontSize: "10px", fontWeight: "800", background: "#3b82f6", padding: "4px 8px", borderRadius: "6px", color: "white" },
+  betQuestion: { fontSize: "18px", fontWeight: "600", margin: "0 0 20px 0", lineHeight: "1.4" },
+  progressWrapper: { marginBottom: "20px" },
+  progressBarContainer: { height: "8px", background: "rgba(0,0,0,0.1)", borderRadius: "4px", overflow: "hidden" },
+  progressFill: { height: "100%", transition: "width 0.5s ease" },
+  percentLabels: { display: "flex", justifyContent: "space-between", fontSize: "12px", marginTop: "8px", fontWeight: "500" },
+  voteRow: { display: "flex", gap: "10px" },
+  voteBtnYes: { flex: 1, background: "rgba(34, 197, 94, 0.2)", color: "#4ade80", border: "1px solid #22c55e", padding: "10px", borderRadius: "10px", cursor: "pointer", fontWeight: "600" },
+  voteBtnNo: { flex: 1, background: "rgba(239, 68, 68, 0.2)", color: "#f87171", border: "1px solid #ef4444", padding: "10px", borderRadius: "10px", cursor: "pointer", fontWeight: "600" },
+  actionBtn: { width: "100%", background: "white", color: "black", border: "none", padding: "12px", borderRadius: "10px", fontWeight: "700", cursor: "pointer" },
+  statusBadge: { color: "#22c55e", fontWeight: "bold", fontSize: "14px" }
 };
+
+export default Home;
