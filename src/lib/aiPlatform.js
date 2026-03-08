@@ -1,4 +1,5 @@
 import { computeUserHistoryStats, predictPassOddsFromHistory } from './aiInsights';
+import { generateContentWithFallback, textModelCandidates } from './geminiClient';
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -14,15 +15,35 @@ function fallbackSynthesis({ rawText, deadlineISO, odds }) {
   };
 }
 
-function fallbackBookie({ ownerName, odds, passCount, failCount }) {
+function hashString(value) {
+  const text = String(value || '');
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function shortGoalSnippet(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return 'this goal';
+  return raw.replace(/^User will submit proof by .*?Goal:\s*/i, '').slice(0, 56);
+}
+
+function fallbackBookie({ ownerName, odds, passCount, failCount, yesPool, noPool, betText }) {
   const name = ownerName || 'This user';
-  if (odds < 40) {
-    return `${name} is running cold: ${passCount} PASS vs ${failCount} FAIL. The YES crowd is taking a real gamble.`;
-  }
-  if (odds > 70) {
-    return `${name} has a strong track record. If you are betting NO, bring data, not vibes.`;
-  }
-  return `${name} sits near coin-flip territory. This market could swing late before deadline.`;
+  const goal = shortGoalSnippet(betText);
+  const marketBias = yesPool === noPool ? 'balanced' : yesPool > noPool ? 'YES-heavy' : 'NO-heavy';
+  const templates = [
+    `${name} has ${passCount} PASS vs ${failCount} FAIL. Market is ${marketBias}; "${goal}" is not a free win.`,
+    `Bookie line: ${odds.toFixed(0)}% follow-through. "${goal}" could flip late.`,
+    `Crowd check: ${marketBias} pool around "${goal}". Execution pressure decides this one.`,
+    `Sharp take: history is ${passCount}-${failCount}. "${goal}" needs consistency, not vibes.`,
+    `${name} enters at ${odds.toFixed(0)}% implied odds. "${goal}" gets harder near deadline.`,
+    `Market is ${marketBias}. Backing "${goal}" means betting on discipline under social pressure.`,
+  ];
+  const idx = hashString(`${name}|${goal}|${odds}|${passCount}|${failCount}|${yesPool}|${noPool}`) % templates.length;
+  return templates[idx];
 }
 
 function fallbackDisputeSummary({ betText, verdict, proofNote, disputeCount }) {
@@ -58,7 +79,7 @@ export function computeTrueOddsFromLastTen(bets, userId) {
 
 export async function synthesizeBet({ rawText, deadlineISO, ownerName, odds }) {
   const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-  const model = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
+  const preferredModel = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
   if (!apiKey) return fallbackSynthesis({ rawText, deadlineISO, odds });
 
   const prompt = [
@@ -72,17 +93,12 @@ export async function synthesizeBet({ rawText, deadlineISO, ownerName, odds }) {
   ].join('\n');
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        generationConfig: { temperature: 0.2, maxOutputTokens: 220 },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      }),
+    const { data } = await generateContentWithFallback({
+      apiKey,
+      modelCandidates: textModelCandidates(preferredModel),
+      generationConfig: { temperature: 0.2, maxOutputTokens: 220 },
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
     });
-    if (!response.ok) return fallbackSynthesis({ rawText, deadlineISO, odds });
-    const data = await response.json();
     const text = data?.candidates?.[0]?.content?.parts?.map((p) => p?.text || '').join('\n').trim() || '';
     const cleaned = text.replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(cleaned);
@@ -96,40 +112,46 @@ export async function synthesizeBet({ rawText, deadlineISO, ownerName, odds }) {
   }
 }
 
-export async function generateBookieComment({ ownerName, odds, passCount, failCount, yesPool, noPool }) {
+export async function generateBookieComment({
+  ownerName,
+  odds,
+  passCount,
+  failCount,
+  yesPool,
+  noPool,
+  betText,
+  deadlineISO,
+}) {
   const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-  const model = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
-  if (!apiKey) return fallbackBookie({ ownerName, odds, passCount, failCount });
+  const preferredModel = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
+  if (!apiKey) return fallbackBookie({ ownerName, odds, passCount, failCount, yesPool, noPool, betText });
 
   const prompt = [
     'You are a sharp but non-toxic AI bookie for a social betting app.',
     'Write one concise top comment under 30 words.',
-    'If pool is one-sided, play devil’s advocate.',
+    'Mention one concrete detail from bet text so comments stay unique.',
+    'If pool is one-sided, play devils advocate.',
     `Owner: ${ownerName}`,
+    `Bet text: ${betText || ''}`,
+    `Deadline: ${deadlineISO || ''}`,
     `True odds: ${odds.toFixed(0)}%`,
     `History: PASS ${passCount}, FAIL ${failCount}`,
     `Pool snapshot YES ${yesPool}, NO ${noPool}`,
   ].join('\n');
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        generationConfig: { temperature: 0.7, maxOutputTokens: 90 },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      }),
+    const { data } = await generateContentWithFallback({
+      apiKey,
+      modelCandidates: textModelCandidates(preferredModel),
+      generationConfig: { temperature: 0.95, maxOutputTokens: 90 },
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
     });
-    if (!response.ok) return fallbackBookie({ ownerName, odds, passCount, failCount });
-    const data = await response.json();
     const text = data?.candidates?.[0]?.content?.parts?.map((p) => p?.text || '').join('\n').trim();
-    return text || fallbackBookie({ ownerName, odds, passCount, failCount });
+    return text || fallbackBookie({ ownerName, odds, passCount, failCount, yesPool, noPool, betText });
   } catch {
-    return fallbackBookie({ ownerName, odds, passCount, failCount });
+    return fallbackBookie({ ownerName, odds, passCount, failCount, yesPool, noPool, betText });
   }
 }
-
 export function generateSecretGesture({ userName }) {
   const gestures = [
     'Give a thumbs up and say your username clearly.',
@@ -153,7 +175,7 @@ export async function summarizeDisputeEvidence({
   predictionCount,
 }) {
   const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-  const model = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
+  const preferredModel = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
   if (!apiKey) {
     return {
       summary: fallbackDisputeSummary({ betText, verdict, proofNote, disputeCount }),
@@ -174,22 +196,12 @@ export async function summarizeDisputeEvidence({
   ].join('\n');
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        generationConfig: { temperature: 0.25, maxOutputTokens: 220 },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      }),
+    const { data } = await generateContentWithFallback({
+      apiKey,
+      modelCandidates: textModelCandidates(preferredModel),
+      generationConfig: { temperature: 0.25, maxOutputTokens: 220 },
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
     });
-    if (!response.ok) {
-      return {
-        summary: fallbackDisputeSummary({ betText, verdict, proofNote, disputeCount }),
-        provider: 'fallback',
-      };
-    }
-    const data = await response.json();
     const text = data?.candidates?.[0]?.content?.parts?.map((p) => p?.text || '').join('\n').trim();
     return {
       summary: text || fallbackDisputeSummary({ betText, verdict, proofNote, disputeCount }),

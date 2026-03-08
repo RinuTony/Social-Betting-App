@@ -185,6 +185,11 @@ service cloud.firestore {
         allow read: if signedIn();
         allow create, update, delete: if signedIn() && request.auth.uid == reactionUserId;
       }
+
+      match /attestations/{attestationUserId} {
+        allow read: if signedIn();
+        allow create, update, delete: if signedIn() && request.auth.uid == attestationUserId;
+      }
     }
   }
 }

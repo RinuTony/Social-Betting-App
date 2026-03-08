@@ -1,4 +1,5 @@
 import { readAsStringAsync, EncodingType } from 'expo-file-system/legacy';
+import { generateContentWithFallback, textModelCandidates } from './geminiClient';
 
 function buildPrompt({ note, betText, deadlineISO }) {
   return [
@@ -42,7 +43,7 @@ async function imageToBase64(uri) {
 
 export async function judgeProof({ note, imageUri, videoUri, secretGesture, betText, deadlineISO }) {
   const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-  const model = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
+  const preferredModel = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
 
   if (!apiKey) {
     throw new Error('Gemini API key is missing. Set EXPO_PUBLIC_GEMINI_API_KEY in .env.');
@@ -69,31 +70,17 @@ export async function judgeProof({ note, imageUri, videoUri, secretGesture, betT
     });
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
+  const { data, model } = await generateContentWithFallback({
+    apiKey,
+    modelCandidates: textModelCandidates(preferredModel),
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: 200,
     },
-    body: JSON.stringify({
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 200,
-      },
-      contents: [{ role: 'user', parts }],
-    }),
+    contents: [{ role: 'user', parts }],
   });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '');
-    throw new Error(
-      `Gemini verification failed (${response.status}). ${errorText ? errorText.slice(0, 220) : ''}`.trim()
-    );
-  }
-
-  const data = await response.json();
   const text = data?.candidates?.[0]?.content?.parts?.map((p) => p?.text || '').join('\n') || '';
   const parsed = parseVerdict(text);
-  if (parsed) return parsed;
+  if (parsed) return { ...parsed, model };
   throw new Error('Gemini verification returned an invalid format. Expected JSON with PASS/FAIL verdict.');
 }

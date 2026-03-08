@@ -17,7 +17,6 @@ import {
 } from 'react-native';
 import Svg, { Circle } from 'react-native-svg';
 import { StatusBar } from 'expo-status-bar';
-import * as ImagePicker from 'expo-image-picker';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import {
   createUserWithEmailAndPassword,
@@ -45,8 +44,6 @@ import { createUsersForActor, rewardCatalog } from './src/data/seed';
 import { createPromise } from './src/logic/betting';
 import TopNav from './src/components/TopNav';
 import { auth, db } from './src/lib/firebase';
-import { judgeProof } from './src/lib/aiJudge';
-import { generateVictoryPoster } from './src/lib/aiPoster';
 import {
   buildPredictiveNudge,
   computeTrueOddsFromLastTen,
@@ -258,6 +255,11 @@ function normalizeBet(docSnap) {
     reviewStatus: payload.reviewStatus || 'NOT_STARTED',
     proofDeadlineAtMs: Number.isFinite(payload.proofDeadlineAtMs) ? payload.proofDeadlineAtMs : 0,
     proofSubmittedAtMs: Number.isFinite(payload.proofSubmittedAtMs) ? payload.proofSubmittedAtMs : 0,
+    checkInAtMs: Number.isFinite(payload.checkInAtMs) ? payload.checkInAtMs : 0,
+    checkInLocationText: payload.checkInLocationText || '',
+    checkInLat: Number.isFinite(payload.checkInLat) ? payload.checkInLat : null,
+    checkInLng: Number.isFinite(payload.checkInLng) ? payload.checkInLng : null,
+    payoutSettledAtMs: Number.isFinite(payload.payoutSettledAtMs) ? payload.payoutSettledAtMs : 0,
     disputeWindowEndsAtMs: Number.isFinite(payload.disputeWindowEndsAtMs) ? payload.disputeWindowEndsAtMs : 0,
     poolYes: Number.isFinite(payload.poolYes) ? payload.poolYes : 0,
     poolNo: Number.isFinite(payload.poolNo) ? payload.poolNo : 0,
@@ -311,6 +313,7 @@ export default function App() {
   const [disputesByBet, setDisputesByBet] = useState({});
   const [commentsByBet, setCommentsByBet] = useState({});
   const [reactionsByBet, setReactionsByBet] = useState({});
+  const [attestationsByBet, setAttestationsByBet] = useState({});
   const [tab, setTab] = useState('Home');
   const [homeFeedFilter, setHomeFeedFilter] = useState('All');
   const [commitmentsView, setCommitmentsView] = useState('My Commitments');
@@ -319,11 +322,14 @@ export default function App() {
   const [profileSection, setProfileSection] = useState('Overview');
   const [showCreateBetModal, setShowCreateBetModal] = useState(false);
   const [showSettingsSheet, setShowSettingsSheet] = useState(false);
-  const [aiDraftLoading, setAiDraftLoading] = useState(false);
   const [aiPreviewLoading, setAiPreviewLoading] = useState(false);
   const [aiPreview, setAiPreview] = useState(null);
+  const [createBetAiStatus, setCreateBetAiStatus] = useState('');
+  const [autoDeleteExpiredCommitments, setAutoDeleteExpiredCommitments] = useState(false);
   const [selectedVoteByBet, setSelectedVoteByBet] = useState({});
   const [votingByBet, setVotingByBet] = useState({});
+  const [attestingByBet, setAttestingByBet] = useState({});
+  const [settlingByBet, setSettlingByBet] = useState({});
   const [voteVisualByBet, setVoteVisualByBet] = useState({});
   const [showCoinBurst, setShowCoinBurst] = useState(false);
   const [selfMeta, setSelfMeta] = useState({
@@ -342,7 +348,6 @@ export default function App() {
   const [deadlinePickerMode, setDeadlinePickerMode] = useState('date');
   const [stakeAmount, setStakeAmount] = useState('0');
   const [proof, setProof] = useState({});
-  const [proofImageByBet, setProofImageByBet] = useState({});
   const [betAmount, setBetAmount] = useState(DEFAULT_BET);
   const [friendEmail, setFriendEmail] = useState('');
   const [friends, setFriends] = useState([]);
@@ -389,6 +394,7 @@ export default function App() {
     const disputeUnsubscribers = {};
     const commentUnsubscribers = {};
     const reactionUnsubscribers = {};
+    const attestationUnsubscribers = {};
 
     const unsubscribeAuth = onAuthStateChanged(auth, (nextUser) => {
       unsubscribeProfile();
@@ -400,6 +406,7 @@ export default function App() {
       Object.values(disputeUnsubscribers).forEach((fn) => fn());
       Object.values(commentUnsubscribers).forEach((fn) => fn());
       Object.values(reactionUnsubscribers).forEach((fn) => fn());
+      Object.values(attestationUnsubscribers).forEach((fn) => fn());
 
       setAuthUser(nextUser);
       setBets([]);
@@ -407,11 +414,13 @@ export default function App() {
       setDisputesByBet({});
       setCommentsByBet({});
       setReactionsByBet({});
+      setAttestationsByBet({});
+      setAttestingByBet({});
+      setSettlingByBet({});
       setFriends([]);
       setIncomingRequests([]);
       setNotifications([]);
       setProof({});
-      setProofImageByBet({});
       setRecapByUser({});
       setRecapProviderByUser({});
       setRecapLoadingByUser({});
@@ -555,6 +564,18 @@ export default function App() {
           }
         });
 
+        Object.keys(attestationUnsubscribers).forEach((betId) => {
+          if (!activeIds.has(betId)) {
+            attestationUnsubscribers[betId]();
+            delete attestationUnsubscribers[betId];
+            setAttestationsByBet((prev) => {
+              const next = { ...prev };
+              delete next[betId];
+              return next;
+            });
+          }
+        });
+
         loadedBets.forEach((bet) => {
           if (predictionUnsubscribers[bet.id]) {
             return;
@@ -612,6 +633,19 @@ export default function App() {
               }));
             }
           );
+
+          attestationUnsubscribers[bet.id] = onSnapshot(
+            collection(db, 'bets', bet.id, 'attestations'),
+            (attestationsSnapshot) => {
+              const attestations = attestationsSnapshot.docs
+                .map((d) => ({ id: d.id, ...(d.data() || {}) }))
+                .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
+              setAttestationsByBet((prev) => ({
+                ...prev,
+                [bet.id]: attestations,
+              }));
+            }
+          );
         });
       });
     });
@@ -627,6 +661,7 @@ export default function App() {
       Object.values(disputeUnsubscribers).forEach((fn) => fn());
       Object.values(commentUnsubscribers).forEach((fn) => fn());
       Object.values(reactionUnsubscribers).forEach((fn) => fn());
+      Object.values(attestationUnsubscribers).forEach((fn) => fn());
     };
   }, []);
 
@@ -639,12 +674,23 @@ export default function App() {
     const mineAndFriends = [...myBets, ...friendFeedBets];
     const deduped = Array.from(new Map(mineAndFriends.map((bet) => [bet.id, bet])).values());
     const merged = deduped
+      .filter((bet) => {
+        const fallbackDeadlineMs = parseDeadlineToMs(bet.deadlineISO || '');
+        const effectiveDeadlineMs =
+          Number.isFinite(bet.proofDeadlineAtMs) && bet.proofDeadlineAtMs > 0
+            ? bet.proofDeadlineAtMs
+            : (Number.isFinite(fallbackDeadlineMs) ? fallbackDeadlineMs : 0);
+        const deadlinePassed = effectiveDeadlineMs > 0 && nowMs > effectiveDeadlineMs;
+        const missingDeadlineForOpen = bet.status === 'OPEN' && effectiveDeadlineMs <= 0;
+        const isExpired = bet.status === 'EXPIRED' || (deadlinePassed && bet.status !== 'SETTLED');
+        return !isExpired && !missingDeadlineForOpen;
+      })
       .map((bet) => ({ ...bet, homeType: inferBetType(bet, selfId) }))
       .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
     if (homeFeedFilter === 'Call Outs') return merged.filter((bet) => bet.homeType === 'CALL_OUT');
     if (homeFeedFilter === 'Commitments') return merged.filter((bet) => bet.homeType === 'COMMITMENT');
     return merged;
-  }, [friendFeedBets, myBets, homeFeedFilter, selfId]);
+  }, [friendFeedBets, myBets, homeFeedFilter, nowMs, selfId]);
   const backingBets = useMemo(() => {
     if (!selfId) return [];
     return friendFeedBets.filter((bet) => bet.ownerId !== selfId);
@@ -784,6 +830,10 @@ export default function App() {
   }, [myBets, selfStats]);
   const selfRecap = selfId ? recapByUser[selfId] : '';
   const selfRecapLoading = selfId ? recapLoadingByUser[selfId] : false;
+  const geminiModelActive = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
+  const geminiKeyRaw = process.env.EXPO_PUBLIC_GEMINI_API_KEY || '';
+  const geminiKeySuffix =
+    geminiKeyRaw.length >= 4 ? `...${geminiKeyRaw.slice(-4)}` : geminiKeyRaw ? '(short)' : '(missing)';
 
   const profileOverlayData = useMemo(() => {
     if (!profileOverlayUserId) return null;
@@ -901,6 +951,33 @@ export default function App() {
       setMessage(nudgeText);
     });
   }, [authUser, bets, selfId]);
+
+  useEffect(() => {
+    if (!selfId || !autoDeleteExpiredCommitments) return;
+    const expiredMine = bets.filter((bet) => bet.ownerId === selfId && inferBetType(bet, selfId) === 'COMMITMENT' && bet.status === 'EXPIRED');
+    if (expiredMine.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      let deleted = 0;
+      for (const bet of expiredMine) {
+        if (cancelled) return;
+        try {
+          await deleteDoc(doc(db, 'bets', bet.id));
+          deleted += 1;
+        } catch {
+          // Continue deleting the rest even if one fails.
+        }
+      }
+      if (!cancelled && deleted > 0) {
+        setMessage(`Auto-deleted ${deleted} expired commitment${deleted > 1 ? 's' : ''}.`);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [autoDeleteExpiredCommitments, bets, selfId]);
 
   function getDisplayNameForUser(userId) {
     if (!userId) return 'Unknown';
@@ -1026,6 +1103,25 @@ export default function App() {
     }
   };
 
+  const deleteBetById = async (betId) => {
+    if (!selfId || !betId) return;
+    const target = bets.find((b) => b.id === betId);
+    if (!target) {
+      setMessage('Bet not found.');
+      return;
+    }
+    if (target.ownerId !== selfId) {
+      setMessage('Only the bet owner can delete this bet.');
+      return;
+    }
+    try {
+      await deleteDoc(doc(db, 'bets', betId));
+      setMessage('Bet deleted.');
+    } catch (error) {
+      setMessage(error?.message || 'Failed to delete bet.');
+    }
+  };
+
   const shareInvite = async () => {
     if (!selfId) return;
     try {
@@ -1056,6 +1152,22 @@ export default function App() {
       const userRef = doc(db, 'users', selfId);
       await runTransaction(db, async (tx) => {
         const snap = await tx.get(userRef);
+        if (!snap.exists()) {
+          tx.set(
+            userRef,
+            {
+              uid: selfId,
+              name: resolveActorName(authUser),
+              email: authUser?.email || '',
+              coins: 1000,
+              plan: 'free',
+              aiCredits: 8,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
         const payload = snap.data() || {};
         const current = Number.isFinite(payload.aiCredits) ? payload.aiCredits : 0;
         if (current <= 0) {
@@ -1176,29 +1288,318 @@ export default function App() {
     }
   };
 
-  const pickProofImage = async (betId) => {
-    try {
-      const permission = await ImagePicker.requestCameraPermissionsAsync();
-      if (!permission.granted) {
-        setMessage('Camera permission denied.');
+  const fetchCurrentCheckInLocation = () =>
+    new Promise((resolve) => {
+      const fallback = {
+        text: 'Location unavailable',
+        lat: null,
+        lng: null,
+      };
+      if (!globalThis?.navigator?.geolocation?.getCurrentPosition) {
+        resolve(fallback);
         return;
       }
+      globalThis.navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const lat = Number.isFinite(pos?.coords?.latitude) ? pos.coords.latitude : null;
+          const lng = Number.isFinite(pos?.coords?.longitude) ? pos.coords.longitude : null;
+          const text =
+            lat !== null && lng !== null ? `${lat.toFixed(4)}, ${lng.toFixed(4)}` : 'Location unavailable';
+          resolve({ text, lat, lng });
+        },
+        () => resolve(fallback),
+        {
+          enableHighAccuracy: false,
+          timeout: 8000,
+          maximumAge: 60000,
+        }
+      );
+    });
 
-      const result = await ImagePicker.launchCameraAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        quality: 0.6,
-        cameraType: ImagePicker.CameraType.back,
+  const applySettlementPayout = async (betId, verdict) => {
+    if (verdict !== 'PASS' && verdict !== 'FAIL') return { applied: false, reason: 'Invalid verdict.' };
+    const betRef = doc(db, 'bets', betId);
+    const betSnap = await getDoc(betRef);
+    if (!betSnap.exists()) return { applied: false, reason: 'Bet not found.' };
+    const bet = normalizeBet(betSnap);
+    if (bet.payoutSettledAtMs > 0) return { applied: false, reason: 'Payout already applied.' };
+
+    const predictionSnap = await getDocs(collection(db, 'bets', betId, 'predictions'));
+    const predictions = predictionSnap.docs.map((d) => normalizePrediction(d));
+    const winnerSide = verdict === 'PASS' ? 'YES' : 'NO';
+    const winners = predictions.filter((p) => p.side === winnerSide);
+    const losers = predictions.filter((p) => p.side !== winnerSide);
+    const winnerTotal = winners.reduce((sum, p) => sum + Math.max(0, Number(p.amount) || 0), 0);
+    const loserTotal = losers.reduce((sum, p) => sum + Math.max(0, Number(p.amount) || 0), 0);
+    const ownerBonus =
+      verdict === 'PASS'
+        ? Math.max(0, Math.round((Number(bet.ownerStake) || 0) * (Number(bet.ownerStakeMultiplier) || 1)))
+        : 0;
+
+    const deltasByUser = {};
+    losers.forEach((p) => {
+      const amount = Math.max(0, Number(p.amount) || 0);
+      if (!p.userId || amount <= 0) return;
+      deltasByUser[p.userId] = (deltasByUser[p.userId] || 0) - amount;
+    });
+
+    if (winnerTotal > 0 && loserTotal > 0) {
+      let distributed = 0;
+      winners.forEach((p, index) => {
+        const amount = Math.max(0, Number(p.amount) || 0);
+        if (!p.userId || amount <= 0) return;
+        const isLast = index === winners.length - 1;
+        const share = isLast ? loserTotal - distributed : Math.floor((loserTotal * amount) / winnerTotal);
+        distributed += share;
+        deltasByUser[p.userId] = (deltasByUser[p.userId] || 0) + share;
       });
+    }
 
-      if (result.canceled || !result.assets?.length) return;
-      const imageUri = result.assets[0].uri;
+    if (bet.ownerId && ownerBonus > 0) {
+      deltasByUser[bet.ownerId] = (deltasByUser[bet.ownerId] || 0) + ownerBonus;
+    }
 
-      setProofImageByBet((prev) => ({
-        ...prev,
-        [betId]: imageUri,
-      }));
+    const now = Date.now();
+    await runTransaction(db, async (tx) => {
+      const freshBetSnap = await tx.get(betRef);
+      if (!freshBetSnap.exists()) return;
+      const freshBet = freshBetSnap.data() || {};
+      if (Number.isFinite(freshBet.payoutSettledAtMs) && freshBet.payoutSettledAtMs > 0) return;
+
+      for (const [uid, delta] of Object.entries(deltasByUser)) {
+        if (!uid || !Number.isFinite(delta) || delta === 0) continue;
+        const userRef = doc(db, 'users', uid);
+        const userSnap = await tx.get(userRef);
+        if (!userSnap.exists()) continue;
+        const payload = userSnap.data() || {};
+        const currentCoins = Number.isFinite(payload.coins) ? payload.coins : 0;
+        tx.update(userRef, {
+          coins: Math.max(0, currentCoins + delta),
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      tx.update(betRef, {
+        payoutSettledAtMs: now,
+        updatedAt: serverTimestamp(),
+      });
+    });
+
+    return { applied: true, winnerSide, winnerTotal, loserTotal, ownerBonus };
+  };
+
+  const settleFromPeerAttestations = async (betId) => {
+    const betRef = doc(db, 'bets', betId);
+    const betSnap = await getDoc(betRef);
+    if (!betSnap.exists()) return { settled: false, passCount: 0, failCount: 0, reason: 'Bet not found.' };
+    const bet = normalizeBet(betSnap);
+    if (bet.status !== 'OPEN') return { settled: false, passCount: 0, failCount: 0, reason: 'Bet already closed.' };
+    if (bet.checkInAtMs <= 0) return { settled: false, passCount: 0, failCount: 0, reason: 'Owner not checked in.' };
+
+    let attestations = attestationsByBet[betId] || [];
+    if (attestations.length === 0) {
+      const attestationsSnap = await getDocs(collection(db, 'bets', betId, 'attestations'));
+      attestations = attestationsSnap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+    }
+    const passCount = attestations.filter((item) => item.verdict === 'PASS').length;
+    const failCount = attestations.filter((item) => item.verdict === 'FAIL').length;
+    const minNeeded = 2;
+
+    let peerVerdict = '';
+    if (passCount >= minNeeded && passCount > failCount) peerVerdict = 'PASS';
+    if (failCount >= minNeeded && failCount > passCount) peerVerdict = 'FAIL';
+    if (!peerVerdict) {
+      return {
+        settled: false,
+        passCount,
+        failCount,
+        reason: 'Need majority with at least 2 matching attestations.',
+      };
+    }
+
+    const now = Date.now();
+    await updateDoc(betRef, {
+      status: 'SETTLED',
+      aiVerdict: peerVerdict,
+      aiReason: `Peer attestation majority (${passCount} pass, ${failCount} fail)`,
+      aiConfidence: null,
+      aiProvider: 'peer_attestation',
+      reviewStatus: 'PEER_RESOLVED',
+      disputeWindowEndsAtMs: now + DISPUTE_WINDOW_MS,
+      updatedAt: serverTimestamp(),
+    });
+    const payoutResult = await applySettlementPayout(betId, peerVerdict);
+
+    const predictions = predictionsByBet[betId] || [];
+    await Promise.all(
+      predictions
+        .filter((p) => p.userId && p.userId !== selfId)
+        .map((p) =>
+          createNotification(p.userId, {
+            type: 'BET_VERDICT',
+            title: 'Bet resolved by peers',
+            body: `${bet.text} -> ${peerVerdict}`,
+            betId,
+          })
+        )
+    );
+    if (payoutResult?.applied) {
+      setMessage(`Peer verdict posted: ${peerVerdict}. Coins settled.`);
+    } else {
+      setMessage(`Peer verdict posted: ${peerVerdict}. ${payoutResult?.reason || ''}`.trim());
+    }
+    return { settled: true, passCount, failCount, reason: '' };
+  };
+
+  const submitCheckIn = async (betId) => {
+    if (!selfId) return;
+    const target = bets.find((b) => b.id === betId);
+    if (!target) return;
+    if (target.ownerId !== selfId) {
+      setMessage('Only the bet owner can check in.');
+      return;
+    }
+    if (target.status !== 'OPEN') {
+      setMessage('Check-in is only available for open bets.');
+      return;
+    }
+    if (target.checkInAtMs > 0) {
+      setMessage('Check-in already submitted.');
+      return;
+    }
+    if (target.proofDeadlineAtMs > 0 && Date.now() > target.proofDeadlineAtMs) {
+      await updateDoc(doc(db, 'bets', betId), {
+        status: 'EXPIRED',
+        reviewStatus: 'AUTO_EXPIRED',
+        updatedAt: serverTimestamp(),
+      });
+      setMessage('Deadline passed. Bet marked EXPIRED.');
+      return;
+    }
+
+    try {
+      const location = await fetchCurrentCheckInLocation();
+      const now = Date.now();
+      await updateDoc(doc(db, 'bets', betId), {
+        proofNote: (proof[betId] || '').trim(),
+        proofSubmittedAtMs: now,
+        checkInAtMs: now,
+        checkInLocationText: location.text,
+        checkInLat: location.lat,
+        checkInLng: location.lng,
+        reviewStatus: 'PENDING_PEER_ATTESTATION',
+        updatedAt: serverTimestamp(),
+      });
+      const predictions = predictionsByBet[betId] || [];
+      await Promise.all(
+        predictions
+          .filter((p) => p.userId && p.userId !== selfId)
+          .map((p) =>
+            createNotification(p.userId, {
+              type: 'PEER_ATTESTATION_NEEDED',
+              title: 'Peer attestation needed',
+              body: `${target.ownerName} checked in for "${target.text}". Attest PASS or FAIL.`,
+              betId,
+            })
+          )
+      );
+      setMessage(`Check-in submitted at ${formatDate(now)} (${location.text}).`);
     } catch (error) {
-      setMessage(error?.message || 'Failed to pick proof image.');
+      setMessage(error?.message || 'Failed to submit check-in.');
+    }
+  };
+
+  const submitAttestation = async (betId, verdict) => {
+    if (!selfId) return;
+    if (verdict !== 'PASS' && verdict !== 'FAIL') return;
+    if (attestingByBet[betId]) return;
+    const target = bets.find((b) => b.id === betId);
+    if (!target) return;
+    if (target.status !== 'OPEN') {
+      setMessage('Attestation is closed for this bet.');
+      return;
+    }
+    if (target.checkInAtMs <= 0) {
+      setMessage('Owner has not checked in yet.');
+      return;
+    }
+    if (target.ownerId === selfId) {
+      setMessage('Owner cannot attest on own bet.');
+      return;
+    }
+    const myPrediction = (predictionsByBet[betId] || []).find((p) => p.userId === selfId);
+    if (!myPrediction) {
+      setMessage('Only backers can attest.');
+      return;
+    }
+    const alreadyAttested = (attestationsByBet[betId] || []).find((item) => item.userId === selfId);
+    if (alreadyAttested) {
+      setMessage(`You already attested ${alreadyAttested.verdict}.`);
+      return;
+    }
+    try {
+      setAttestingByBet((prev) => ({ ...prev, [betId]: true }));
+      setMessage('Submitting attestation...');
+      await setDoc(
+        doc(db, 'bets', betId, 'attestations', selfId),
+        {
+          userId: selfId,
+          userName: resolveActorName(authUser),
+          verdict,
+          createdAtMs: Date.now(),
+          createdAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      setAttestationsByBet((prev) => {
+        const current = prev[betId] || [];
+        const filtered = current.filter((item) => item.userId !== selfId);
+        return {
+          ...prev,
+          [betId]: [
+            {
+              id: selfId,
+              userId: selfId,
+              userName: resolveActorName(authUser),
+              verdict,
+              createdAtMs: Date.now(),
+            },
+            ...filtered,
+          ],
+        };
+      });
+      setMessage(`Attested ${verdict}. Waiting for owner settlement.`);
+    } catch (error) {
+      setMessage(error?.message || 'Failed to submit attestation.');
+    } finally {
+      setAttestingByBet((prev) => ({ ...prev, [betId]: false }));
+    }
+  };
+
+  const settleAsOwner = async (betId) => {
+    if (!selfId) return;
+    if (settlingByBet[betId]) return;
+    const target = bets.find((b) => b.id === betId);
+    if (!target) return;
+    if (target.ownerId !== selfId) {
+      setMessage('Only the bet owner can settle attestations.');
+      return;
+    }
+    try {
+      setSettlingByBet((prev) => ({ ...prev, [betId]: true }));
+      setMessage('Checking attestations...');
+      const result = await settleFromPeerAttestations(betId);
+      if (!result?.settled) {
+        setMessage(
+          `${result?.reason || 'Not enough peer attestations yet.'} PASS ${result?.passCount || 0} | FAIL ${
+            result?.failCount || 0
+          }`
+        );
+      }
+    } catch (error) {
+      setMessage(error?.message || 'Failed to settle from attestations.');
+    } finally {
+      setSettlingByBet((prev) => ({ ...prev, [betId]: false }));
     }
   };
 
@@ -1249,6 +1650,8 @@ export default function App() {
         failCount: trueOddsMeta.fail,
         yesPool: 0,
         noPool: 0,
+        betText: synthesis.formattedBet || base.text,
+        deadlineISO: base.deadlineISO,
       });
       await setDoc(doc(db, 'bets', base.id), {
         id: base.id,
@@ -1275,6 +1678,11 @@ export default function App() {
         proofVideoUri: '',
         proofDeadlineAtMs: deadlineMs,
         proofSubmittedAtMs: 0,
+        checkInAtMs: 0,
+        checkInLocationText: '',
+        checkInLat: null,
+        checkInLng: null,
+        payoutSettledAtMs: 0,
         disputeWindowEndsAtMs: 0,
         poolYes: 0,
         poolNo: 0,
@@ -1327,46 +1735,20 @@ export default function App() {
     }
   };
 
-  const runAiDraftBet = async () => {
-    if (!betText.trim()) {
-      setMessage('Write a rough commitment first.');
-      return;
-    }
-    const resolvedDeadline = deadline.trim() || formatDeadlineInput(deadlineDate);
-    const deadlineMs = parseDeadlineToMs(resolvedDeadline);
-    if (!Number.isFinite(deadlineMs)) {
-      setMessage('Pick a valid deadline first.');
-      return;
-    }
-    const creditOk = await consumeAiCredit('AI draft');
-    if (!creditOk) return;
-    setAiDraftLoading(true);
-    try {
-      const stats = computeUserHistoryStats(bets, authUser?.uid || '');
-      const odds = predictPassOddsFromHistory(stats);
-      const synthesis = await synthesizeBet({
-        rawText: betText.trim(),
-        deadlineISO: resolvedDeadline,
-        ownerName: resolveActorName(authUser),
-        odds,
-      });
-      setBetText(synthesis.formattedBet || betText.trim());
-      setMessage(`AI draft ready (${synthesis.provider || 'fallback'}).`);
-    } catch (error) {
-      setMessage(error?.message || 'AI draft failed.');
-    } finally {
-      setAiDraftLoading(false);
-    }
-  };
-
   const runAiBetPreview = async () => {
     if (!betText.trim()) {
       setMessage('Add bet text first.');
+      setCreateBetAiStatus('Add bet text first.');
       return;
     }
+    setCreateBetAiStatus('Checking AI access...');
     const creditOk = await consumeAiCredit('AI preview');
-    if (!creditOk) return;
+    if (!creditOk) {
+      setCreateBetAiStatus('AI unavailable. Check credits/plan in Profile > Betme AI Access.');
+      return;
+    }
     setAiPreviewLoading(true);
+    setCreateBetAiStatus('Generating preview...');
     try {
       const trueOddsMeta = computeTrueOddsFromLastTen(bets, authUser?.uid || '');
       const selfStatsSnapshot = computeUserHistoryStats(bets, authUser?.uid || '');
@@ -1378,14 +1760,18 @@ export default function App() {
         failCount: trueOddsMeta.fail,
         yesPool: 0,
         noPool: 0,
+        betText: betText.trim(),
+        deadlineISO: deadline.trim(),
       });
       setAiPreview({
         odds: Math.round(selfOdds),
         riskLabel: trueOddsMeta.riskLabel,
         bookie,
       });
+      setCreateBetAiStatus('AI preview ready.');
     } catch (error) {
       setMessage(error?.message || 'AI preview failed.');
+      setCreateBetAiStatus(error?.message || 'AI preview failed.');
     } finally {
       setAiPreviewLoading(false);
     }
@@ -1396,6 +1782,7 @@ export default function App() {
       setDeadline(formatDeadlineInput(deadlineDate));
     }
     setAiPreview(null);
+    setCreateBetAiStatus('');
     setShowCreateBetModal(true);
   };
 
@@ -1547,144 +1934,6 @@ export default function App() {
     placePrediction(betId, side);
   };
 
-  const submitEvidenceWithShutter = (betId) => {
-    Animated.sequence([
-      Animated.timing(shutterAnim, {
-        toValue: 1,
-        duration: 120,
-        useNativeDriver: true,
-      }),
-      Animated.timing(shutterAnim, {
-        toValue: 0,
-        duration: 220,
-        useNativeDriver: true,
-      }),
-    ]).start();
-    submitProof(betId);
-  };
-
-  const submitProof = async (betId) => {
-    if (!selfId) {
-      return;
-    }
-
-    const note = proof[betId] || '';
-    const imageUri = proofImageByBet[betId] || '';
-    const target = bets.find((b) => b.id === betId);
-
-    if (!target || target.status !== 'OPEN') {
-      return;
-    }
-
-    if (target.ownerId !== selfId) {
-      setMessage('Only the bet owner can submit proof.');
-      return;
-    }
-
-    if (!imageUri) {
-      setMessage('Proof photo is required for AI verification.');
-      return;
-    }
-
-    if (target.proofSubmittedAtMs > 0) {
-      setMessage('Proof already submitted once for this bet.');
-      return;
-    }
-
-    if (target.proofDeadlineAtMs > 0 && Date.now() > target.proofDeadlineAtMs) {
-      await updateDoc(doc(db, 'bets', betId), {
-        status: 'EXPIRED',
-        reviewStatus: 'AUTO_EXPIRED',
-        updatedAt: serverTimestamp(),
-      });
-      setMessage('Proof deadline passed. Bet marked EXPIRED.');
-      return;
-    }
-
-    try {
-      const aiResult = await judgeProof({
-        note,
-        imageUri,
-        videoUri: '',
-        secretGesture: '',
-        betText: target.text,
-        deadlineISO: target.deadlineISO,
-      });
-      const posterStyle = Math.random() < 0.5 ? 'cinematic movie poster' : 'vintage comic book cover';
-      const posterResult = await generateVictoryPoster({
-        betText: target.text,
-        proofNote: note,
-        proofImageUri: imageUri,
-        ownerName: target.ownerName,
-        style: posterStyle,
-      });
-      const now = Date.now();
-
-      // Avoid oversized document writes with data-URI payloads.
-      const posterUriToStore =
-        typeof posterResult.posterUri === 'string' && posterResult.posterUri.length <= 700000
-          ? posterResult.posterUri
-          : '';
-
-      await updateDoc(doc(db, 'bets', betId), {
-        status: 'SETTLED',
-        aiVerdict: aiResult.verdict,
-        aiReason: aiResult.reason,
-        aiConfidence: aiResult.confidence,
-        aiProvider: aiResult.provider,
-        reviewStatus: 'AUTO_RESOLVED',
-        proofNote: note,
-        proofImageUri: imageUri || '',
-        proofVideoUri: '',
-        victoryPosterUri: posterUriToStore,
-        victoryPosterStyle: posterResult.style || '',
-        victoryPosterProvider: posterResult.provider || 'fallback',
-        victoryPosterError:
-          posterUriToStore ? posterResult.warning || '' : 'Poster too large to store. Generate again later.',
-        proofSubmittedAtMs: now,
-        disputeWindowEndsAtMs: now + DISPUTE_WINDOW_MS,
-        updatedAt: serverTimestamp(),
-      });
-
-      const predictions = predictionsByBet[betId] || [];
-      await Promise.all(
-        predictions
-          .filter((p) => p.userId && p.userId !== selfId)
-          .map((p) =>
-            createNotification(p.userId, {
-              type: 'BET_VERDICT',
-              title: 'Bet verdict posted',
-              body: `${target.text} -> ${aiResult.verdict}`,
-              betId,
-            })
-          )
-      );
-
-
-      const myPrediction = (predictionsByBet[betId] || []).find((p) => p.userId === selfId);
-      const ownerStake = Number.isFinite(target.ownerStake) ? target.ownerStake : 0;
-      const ownerStakeMultiplier = Number.isFinite(target.ownerStakeMultiplier) ? target.ownerStakeMultiplier : 1.8;
-      if (selfId && self && myPrediction) {
-        const winnerSide = aiResult.verdict === 'PASS' ? 'YES' : 'NO';
-        const delta = myPrediction.side === winnerSide ? myPrediction.amount : -myPrediction.amount;
-        const stakePayout = aiResult.verdict === 'PASS' ? Math.round(ownerStake * ownerStakeMultiplier) : 0;
-        const nextCoins = Math.max(0, self.coins + delta + stakePayout);
-
-        await updateDoc(doc(db, 'users', selfId), {
-          coins: nextCoins,
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      const posterMsg = posterUriToStore
-        ? ` Victory poster ready (${posterResult.provider}).`
-        : ` Poster fallback used (${posterResult.provider}).`;
-      setMessage(`AI verdict: ${aiResult.verdict} (${aiResult.provider}). Bet settled.${posterMsg}`);
-    } catch (error) {
-      setMessage(error?.message || 'Failed to submit proof.');
-    }
-  };
-
   const raiseDispute = async (betId) => {
     if (!selfId) return;
 
@@ -1777,7 +2026,12 @@ export default function App() {
         reviewStatus: 'MANUAL_RESOLVED',
         updatedAt: serverTimestamp(),
       });
-      setMessage(`Manual review resolved: ${verdict}.`);
+      const payoutResult = await applySettlementPayout(betId, verdict);
+      if (payoutResult?.applied) {
+        setMessage(`Manual review resolved: ${verdict}. Coins settled.`);
+      } else {
+        setMessage(`Manual review resolved: ${verdict}. ${payoutResult?.reason || ''}`.trim());
+      }
     } catch (error) {
       setMessage(error?.message || 'Failed to resolve manual review.');
     }
@@ -2049,8 +2303,12 @@ export default function App() {
               {homeFeedBets.map((bet) => {
                 const predictions = predictionsByBet[bet.id] || [];
                 const myPrediction = predictions.find((p) => p.userId === selfId);
-                const proofDeadlinePassed =
-                  bet.proofDeadlineAtMs > 0 && Date.now() > bet.proofDeadlineAtMs;
+                const fallbackDeadlineMs = parseDeadlineToMs(bet.deadlineISO || '');
+                const effectiveDeadlineMs =
+                  Number.isFinite(bet.proofDeadlineAtMs) && bet.proofDeadlineAtMs > 0
+                    ? bet.proofDeadlineAtMs
+                    : (Number.isFinite(fallbackDeadlineMs) ? fallbackDeadlineMs : 0);
+                const proofDeadlinePassed = effectiveDeadlineMs > 0 && Date.now() > effectiveDeadlineMs;
                 const yesBacker = predictions.find((prediction) => prediction.side === 'YES');
                 const noBacker = predictions.find((prediction) => prediction.side === 'NO');
                 const canVote =
@@ -2058,6 +2316,7 @@ export default function App() {
                   bet.ownerId !== selfId &&
                   !myPrediction &&
                   !proofDeadlinePassed;
+                const canDelete = bet.ownerId === selfId;
                 const selectedSide = selectedVoteByBet[bet.id];
                 const voteLoading = !!votingByBet[bet.id];
                 const voteVisual = voteVisualByBet[bet.id];
@@ -2066,7 +2325,7 @@ export default function App() {
                 const oddsYes = Math.round(baseRatio * 100);
                 const oddsNo = 100 - oddsYes;
                 const statusTag = bet.status === 'OPEN' ? (myPrediction ? 'Voted' : 'Active') : 'Closed';
-                const timeText = formatTimeRemaining(bet.proofDeadlineAtMs, nowMs);
+                const timeText = effectiveDeadlineMs > 0 ? formatTimeRemaining(effectiveDeadlineMs, nowMs) : 'No deadline';
                 const category = getBetTag(bet.text);
 
                 return (
@@ -2084,9 +2343,20 @@ export default function App() {
                           {bet.homeType === 'COMMITMENT' ? 'COMMITMENT' : 'CALL OUT'}
                         </Text>
                       </View>
+                      {canDelete && (
+                        <Pressable style={styles.deletePillBtn} onPress={() => deleteBetById(bet.id)}>
+                          <Text style={styles.deletePillText}>Delete</Text>
+                        </Pressable>
+                      )}
                     </View>
 
                     <Text style={styles.mockBetTitle}>{cleanBetCardTitle(bet.text)}</Text>
+                    {!!bet.aiBookieComment && (
+                      <View style={styles.bookiePanel}>
+                        <Text style={styles.bookieLabel}>AI Bookie</Text>
+                        <Text style={styles.bookieText}>{bet.aiBookieComment}</Text>
+                      </View>
+                    )}
 
                     <View style={styles.mockTagsRow}>
                       <View style={styles.mockSoftTag}>
@@ -2198,6 +2468,11 @@ export default function App() {
               const selectedSide = selectedVoteByBet[bet.id];
               const voteLoading = !!votingByBet[bet.id];
               const voteVisual = voteVisualByBet[bet.id];
+              const attestationList = attestationsByBet[bet.id] || [];
+              const myAttestation = attestationList.find((item) => item.userId === selfId);
+              const attestingNow = !!attestingByBet[bet.id];
+              const settlingNow = !!settlingByBet[bet.id];
+              const canDelete = bet.ownerId === selfId;
               const baseRatio = bet.poolTotal > 0 ? bet.poolYes / bet.poolTotal : 0.5;
               const ratio = Number.isFinite(voteVisual?.ratio) ? voteVisual.ratio : baseRatio;
               const oddsYes = Math.round(baseRatio * 100);
@@ -2226,9 +2501,20 @@ export default function App() {
                     <View style={styles.commitTypePill}>
                       <Text style={styles.commitTypePillText}>COMMITMENT</Text>
                     </View>
+                    {canDelete && (
+                      <Pressable style={styles.deletePillBtn} onPress={() => deleteBetById(bet.id)}>
+                        <Text style={styles.deletePillText}>Delete</Text>
+                      </Pressable>
+                    )}
                   </View>
 
                   <Text style={styles.commitTitle}>{cleanBetCardTitle(bet.text)}</Text>
+                  {!!bet.aiBookieComment && (
+                    <View style={styles.bookiePanel}>
+                      <Text style={styles.bookieLabel}>AI Bookie</Text>
+                      <Text style={styles.bookieText}>{bet.aiBookieComment}</Text>
+                    </View>
+                  )}
 
                   <View style={styles.commitMetaRow}>
                     <View style={styles.mockSoftTag}>
@@ -2299,6 +2585,23 @@ export default function App() {
                     </View>
                   )}
 
+                  {bet.checkInAtMs > 0 && (
+                    <View style={styles.attestMetaBox}>
+                      <Text style={styles.attestMetaText}>{`Check-in: ${formatDate(bet.checkInAtMs)}`}</Text>
+                      <Text style={styles.attestMetaText}>{`Location: ${bet.checkInLocationText || 'Unavailable'}`}</Text>
+                      <Text style={styles.attestMetaText}>
+                        {`Attestations: PASS ${
+                          attestationList.filter((item) => item.verdict === 'PASS').length
+                        } | FAIL ${
+                          attestationList.filter((item) => item.verdict === 'FAIL').length
+                        }`}
+                      </Text>
+                      {!!myAttestation && (
+                        <Text style={styles.attestMetaText}>{`You attested: ${myAttestation.verdict}`}</Text>
+                      )}
+                    </View>
+                  )}
+
                   {commitmentsView === 'My Commitments' && bet.ownerId === selfId && bet.status === 'OPEN' && (
                     <View style={styles.proofWrap}>
                       <TextInput
@@ -2309,23 +2612,56 @@ export default function App() {
                             [bet.id]: value,
                           }))
                         }
-                        placeholder="Proof note (optional)"
+                        placeholder="Check-in note (optional)"
                         placeholderTextColor="#7F73A3"
                         style={styles.input}
                       />
-                      {!!proofImageByBet[bet.id] && (
-                        <Image source={{ uri: proofImageByBet[bet.id] }} style={styles.proofImage} />
-                      )}
-                      <Pressable style={styles.dropzone} onPress={() => pickProofImage(bet.id)}>
-                        <Text style={styles.dropzoneText}>
-                          {proofImageByBet[bet.id] ? 'Photo Added' : 'Capture Proof Photo'}
+                      <Pressable
+                        style={[styles.submitEvidenceBtn, bet.checkInAtMs > 0 && styles.mockVoteBtnDisabled]}
+                        onPress={() => submitCheckIn(bet.id)}
+                        disabled={bet.checkInAtMs > 0}
+                      >
+                        <Text style={styles.primaryBtnText}>
+                          {bet.checkInAtMs > 0 ? 'Checked In' : 'Check In (Time + Location)'}
                         </Text>
                       </Pressable>
-                      <Pressable style={styles.submitEvidenceBtn} onPress={() => submitEvidenceWithShutter(bet.id)}>
-                        <Text style={styles.primaryBtnText}>Submit Evidence</Text>
-                      </Pressable>
+                      {bet.checkInAtMs > 0 && (
+                        <Pressable
+                          style={[styles.smallBtnAlt, settlingNow && styles.mockVoteBtnDisabled]}
+                          onPress={() => settleAsOwner(bet.id)}
+                          disabled={settlingNow}
+                        >
+                          <Text style={styles.smallBtnText}>
+                            {settlingNow ? 'Settling...' : 'Settle From Attestations'}
+                          </Text>
+                        </Pressable>
+                      )}
                     </View>
                   )}
+
+                  {commitmentsView === 'Backing' &&
+                    bet.status === 'OPEN' &&
+                    bet.checkInAtMs > 0 &&
+                    bet.ownerId !== selfId &&
+                    !!predictions.find((prediction) => prediction.userId === selfId) &&
+                    !myAttestation && (
+                      <View style={styles.mockActionRow}>
+                        <Pressable
+                          style={[styles.mockVoteYesBtn, attestingNow && styles.mockVoteBtnDisabled]}
+                          onPress={() => submitAttestation(bet.id, 'PASS')}
+                          disabled={attestingNow}
+                        >
+                          <Text style={styles.mockVoteYesText}>{attestingNow ? 'Submitting...' : 'Attest Pass'}</Text>
+                        </Pressable>
+                        <Pressable
+                          style={[styles.mockVoteNoBtn, attestingNow && styles.mockVoteBtnDisabled]}
+                          onPress={() => submitAttestation(bet.id, 'FAIL')}
+                          disabled={attestingNow}
+                        >
+                          <Text style={styles.mockVoteNoText}>{attestingNow ? 'Submitting...' : 'Attest Fail'}</Text>
+                        </Pressable>
+                      </View>
+                    )}
 
                   {bet.aiVerdict === 'PASS' && (
                     <View style={styles.commitCompleteBanner}>
@@ -2672,13 +3008,11 @@ export default function App() {
                 />
               )}
               <View style={styles.createModalActions}>
-                <Pressable style={styles.smallBtn} onPress={runAiDraftBet} disabled={aiDraftLoading}>
-                  <Text style={styles.smallBtnText}>{aiDraftLoading ? 'AI Drafting...' : 'AI Draft'}</Text>
-                </Pressable>
                 <Pressable style={styles.smallBtnAlt} onPress={runAiBetPreview} disabled={aiPreviewLoading}>
                   <Text style={styles.smallBtnText}>{aiPreviewLoading ? 'Previewing...' : 'AI Preview'}</Text>
                 </Pressable>
               </View>
+              {!!createBetAiStatus && <Text style={styles.createAiStatusText}>{createBetAiStatus}</Text>}
               {!!aiPreview && (
                 <View style={styles.aiPreviewCard}>
                   <Text style={styles.aiPreviewTitle}>{`AI Odds ${aiPreview.odds}%`}</Text>
@@ -2714,6 +3048,19 @@ export default function App() {
               <View style={styles.settingsRow}>
                 <Text style={styles.meta}>AI Credits</Text>
                 <Text style={styles.walletName}>{selfMeta.aiCredits}</Text>
+              </View>
+              <View style={styles.settingsRow}>
+                <Text style={styles.meta}>Auto-delete expired commitments</Text>
+                <Pressable
+                  style={[styles.smallBtnAlt, !autoDeleteExpiredCommitments && styles.smallBtn]}
+                  onPress={() => setAutoDeleteExpiredCommitments((prev) => !prev)}
+                >
+                  <Text style={styles.smallBtnText}>{autoDeleteExpiredCommitments ? 'On' : 'Off'}</Text>
+                </Pressable>
+              </View>
+              <View style={styles.settingsDebugBox}>
+                <Text style={styles.settingsDebugText}>{`Gemini Model: ${geminiModelActive}`}</Text>
+                <Text style={styles.settingsDebugText}>{`Gemini Key: ${geminiKeySuffix}`}</Text>
               </View>
               <Pressable style={styles.smallBtnAlt} onPress={handleLogout}>
                 <Text style={styles.smallBtnText}>Logout</Text>
@@ -3021,12 +3368,49 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: 0.4,
   },
+  deletePillBtn: {
+    marginLeft: 6,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: 'rgba(154, 40, 40, 0.7)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 140, 140, 0.5)',
+  },
+  deletePillText: {
+    color: '#FFE3E3',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.3,
+  },
   mockBetTitle: {
     color: '#F4F0FF',
     fontSize: 20,
     lineHeight: 28,
     fontWeight: '700',
     marginBottom: 12,
+  },
+  bookiePanel: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(156, 128, 255, 0.34)',
+    backgroundColor: 'rgba(36, 27, 68, 0.42)',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 10,
+  },
+  bookieLabel: {
+    color: '#BE9BFF',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+    marginBottom: 4,
+  },
+  bookieText: {
+    color: '#D9CCFF',
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '600',
   },
   mockTagsRow: {
     flexDirection: 'row',
@@ -3680,6 +4064,12 @@ const styles = StyleSheet.create({
     gap: 8,
     marginBottom: 10,
   },
+  createAiStatusText: {
+    color: '#B9B1D6',
+    fontSize: 12,
+    marginBottom: 10,
+    fontWeight: '600',
+  },
   betTypeTabs: {
     flexDirection: 'row',
     gap: 8,
@@ -3735,6 +4125,19 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: 'rgba(139,92,246,0.22)',
     paddingBottom: 8,
+  },
+  settingsDebugBox: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(126,72,219,0.35)',
+    backgroundColor: 'rgba(35, 28, 54, 0.75)',
+    padding: 10,
+    marginBottom: 10,
+  },
+  settingsDebugText: {
+    color: '#CFC6E7',
+    fontSize: 12,
+    marginBottom: 2,
   },
   title: {
     fontSize: 34,
@@ -3982,6 +4385,22 @@ const styles = StyleSheet.create({
   proofWrap: {
     marginTop: 4,
     marginBottom: 8,
+  },
+  attestMetaBox: {
+    marginTop: 8,
+    marginBottom: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(89, 114, 255, 0.25)',
+    backgroundColor: 'rgba(37, 44, 78, 0.35)',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    gap: 3,
+  },
+  attestMetaText: {
+    color: '#C4D4FF',
+    fontSize: 12,
+    fontWeight: '600',
   },
   proofImage: {
     width: '100%',

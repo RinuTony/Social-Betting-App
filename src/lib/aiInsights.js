@@ -1,3 +1,5 @@
+import { generateContentWithFallback, textModelCandidates } from './geminiClient';
+
 function safePct(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 0;
@@ -47,7 +49,7 @@ function fallbackRecap({ userName, stats, odds }) {
 
 export async function generateUserRecap({ userName, stats, odds }) {
   const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-  const model = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
+  const preferredModel = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
 
   if (!apiKey) {
     return {
@@ -68,27 +70,15 @@ export async function generateUserRecap({ userName, stats, odds }) {
   ].join('\n');
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens: 180,
-        },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      }),
+    const { data } = await generateContentWithFallback({
+      apiKey,
+      modelCandidates: textModelCandidates(preferredModel),
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 180,
+      },
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
     });
-
-    if (!response.ok) {
-      return {
-        recap: fallbackRecap({ userName, stats, odds }),
-        provider: 'fallback',
-      };
-    }
-
-    const data = await response.json();
     const text = data?.candidates?.[0]?.content?.parts?.map((p) => p?.text || '').join('\n').trim();
     if (!text) {
       return {

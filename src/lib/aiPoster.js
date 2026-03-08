@@ -1,4 +1,5 @@
 import { readAsStringAsync, EncodingType } from 'expo-file-system/legacy';
+import { generateContentWithFallback, imageModelCandidates } from './geminiClient';
 
 function buildPosterPrompt({ betText, proofNote, ownerName, style }) {
   return [
@@ -52,7 +53,7 @@ export async function generateVictoryPoster({
   style = 'cinematic movie poster',
 }) {
   const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-  const model =
+  const preferredModel =
     process.env.EXPO_PUBLIC_GEMINI_IMAGE_MODEL ||
     process.env.EXPO_PUBLIC_GEMINI_MODEL ||
     'gemini-2.0-flash-preview-image-generation';
@@ -85,13 +86,11 @@ export async function generateVictoryPoster({
     };
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
+  let data;
+  try {
+    const result = await generateContentWithFallback({
+      apiKey,
+      modelCandidates: imageModelCandidates(preferredModel),
       generationConfig: {
         temperature: 0.8,
         responseModalities: ['TEXT', 'IMAGE'],
@@ -110,19 +109,16 @@ export async function generateVictoryPoster({
           ],
         },
       ],
-    }),
-  });
-
-  if (!response.ok) {
+    });
+    data = result.data;
+  } catch (error) {
     return {
       posterUri: proofImageUri,
       provider: 'fallback',
       style,
-      warning: `Gemini poster request failed (${response.status}). Using original proof image.`,
+      warning: `Gemini poster request failed. ${error?.message || 'Using original proof image.'}`,
     };
   }
-
-  const data = await response.json();
   const imagePart = extractInlineImage(data?.candidates);
   if (!imagePart) {
     return {
