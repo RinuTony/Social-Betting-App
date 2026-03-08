@@ -1,5 +1,4 @@
 import { readAsStringAsync, EncodingType } from 'expo-file-system/legacy';
-import { evaluateWithMockAI } from '../logic/betting';
 
 function buildPrompt({ note, betText, deadlineISO }) {
   return [
@@ -17,7 +16,8 @@ function parseVerdict(text) {
   const cleaned = (text || '').replace(/```json|```/g, '').trim();
   try {
     const parsed = JSON.parse(cleaned);
-    const verdict = parsed?.verdict === 'PASS' ? 'PASS' : 'FAIL';
+    const verdict = parsed?.verdict;
+    if (verdict !== 'PASS' && verdict !== 'FAIL') return null;
     const reason = typeof parsed?.reason === 'string' ? parsed.reason : 'No reason provided.';
     const confidence = Number(parsed?.confidence);
     return {
@@ -45,13 +45,7 @@ export async function judgeProof({ note, imageUri, videoUri, secretGesture, betT
   const model = process.env.EXPO_PUBLIC_GEMINI_MODEL || 'gemini-1.5-flash';
 
   if (!apiKey) {
-    const verdict = evaluateWithMockAI(note);
-    return {
-      verdict,
-      reason: 'Mock AI fallback: no Gemini key configured.',
-      confidence: 0.5,
-      provider: 'mock',
-    };
+    throw new Error('Gemini API key is missing. Set EXPO_PUBLIC_GEMINI_API_KEY in .env.');
   }
 
   const parts = [{ text: buildPrompt({ note, betText, deadlineISO }) }];
@@ -91,25 +85,15 @@ export async function judgeProof({ note, imageUri, videoUri, secretGesture, betT
   });
 
   if (!response.ok) {
-    const verdict = evaluateWithMockAI(note);
-    return {
-      verdict,
-      reason: `Mock fallback: Gemini request failed (${response.status}).`,
-      confidence: 0.4,
-      provider: 'mock',
-    };
+    const errorText = await response.text().catch(() => '');
+    throw new Error(
+      `Gemini verification failed (${response.status}). ${errorText ? errorText.slice(0, 220) : ''}`.trim()
+    );
   }
 
   const data = await response.json();
   const text = data?.candidates?.[0]?.content?.parts?.map((p) => p?.text || '').join('\n') || '';
   const parsed = parseVerdict(text);
   if (parsed) return parsed;
-
-  const verdict = evaluateWithMockAI(note);
-  return {
-    verdict,
-    reason: 'Mock fallback: could not parse Gemini response.',
-    confidence: 0.4,
-    provider: 'mock',
-  };
+  throw new Error('Gemini verification returned an invalid format. Expected JSON with PASS/FAIL verdict.');
 }

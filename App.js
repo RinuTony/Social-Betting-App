@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   SafeAreaView,
   ScrollView,
@@ -10,7 +10,12 @@ import {
   Image,
   Share,
   Platform,
+  Modal,
+  Animated,
+  Easing,
+  Vibration,
 } from 'react-native';
+import Svg, { Circle } from 'react-native-svg';
 import { StatusBar } from 'expo-status-bar';
 import * as ImagePicker from 'expo-image-picker';
 import DateTimePicker from '@react-native-community/datetimepicker';
@@ -46,7 +51,6 @@ import {
   buildPredictiveNudge,
   computeTrueOddsFromLastTen,
   generateBookieComment,
-  generateSecretGesture,
   summarizeDisputeEvidence,
   synthesizeBet,
 } from './src/lib/aiPlatform';
@@ -74,6 +78,12 @@ function parseDeadlineToMs(value) {
   return Number.isFinite(ms) ? ms : NaN;
 }
 
+function buildReferralCode(name, uid) {
+  const base = (name || 'player').replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 5) || 'PLAYER';
+  const tail = (uid || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 4) || '0000';
+  return `${base}${tail}`;
+}
+
 function formatDeadlineInput(date) {
   if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
   const year = date.getFullYear();
@@ -87,6 +97,19 @@ function formatDeadlineInput(date) {
 function formatDate(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return 'N/A';
   return new Date(ms).toLocaleString();
+}
+
+function formatTimeRemaining(deadlineMs, nowMs) {
+  if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) return 'N/A';
+  const diff = deadlineMs - nowMs;
+  if (diff <= 0) return 'Expired';
+  const hours = Math.floor(diff / (60 * 60 * 1000));
+  const minutes = Math.floor((diff % (60 * 60 * 1000)) / (60 * 1000));
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24);
+    return `${days}d ${hours % 24}h left`;
+  }
+  return `${hours}h ${minutes}m left`;
 }
 
 function computeStreak(bets, userId) {
@@ -120,6 +143,84 @@ function getInitials(name) {
   return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
 }
 
+function toHandle(name) {
+  const handle = (name || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+  return `@${handle || 'player'}`;
+}
+
+function inferBetType(bet, selfId) {
+  if (bet?.betType === 'CALL_OUT' || bet?.betType === 'COMMITMENT') return bet.betType;
+  return bet?.ownerId === selfId ? 'COMMITMENT' : 'CALL_OUT';
+}
+
+function cleanBetCardTitle(text) {
+  const value = (text || '').trim();
+  return value.replace(/^User will submit proof by .*?Goal:\s*/i, '').trim();
+}
+
+function DeadlineRingAvatar({ initials, progress, onPress }) {
+  const size = 42;
+  const stroke = 3;
+  const radius = (size - stroke) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const pct = Math.max(0, Math.min(1, progress));
+  const dashOffset = circumference * (1 - pct);
+  return (
+    <Pressable onPress={onPress} style={styles.ringWrap}>
+      <Svg width={size} height={size} style={styles.ringSvg}>
+        <Circle cx={size / 2} cy={size / 2} r={radius} stroke="#3D3D3D" strokeWidth={stroke} fill="transparent" />
+        <Circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          stroke="#F0F0F0"
+          strokeWidth={stroke}
+          strokeDasharray={`${circumference} ${circumference}`}
+          strokeDashoffset={dashOffset}
+          strokeLinecap="round"
+          rotation="-90"
+          origin={`${size / 2}, ${size / 2}`}
+          fill="transparent"
+        />
+      </Svg>
+      <View style={styles.ownerBadge}>
+        <Text style={styles.ownerBadgeText}>{initials}</Text>
+      </View>
+    </Pressable>
+  );
+}
+
+function LiquidPoolBar({ ratio, majorityYes }) {
+  const animated = useRef(new Animated.Value(Math.max(0, Math.min(1, ratio)))).current;
+  useEffect(() => {
+    Animated.timing(animated, {
+      toValue: Math.max(0, Math.min(1, ratio)),
+      duration: 500,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: false,
+    }).start();
+  }, [animated, ratio]);
+
+  const width = animated.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0%', '100%'],
+  });
+
+  return (
+    <View style={styles.poolTrack}>
+      <Animated.View
+        style={[
+          styles.poolLiquidFill,
+          majorityYes ? styles.poolLiquidYes : styles.poolLiquidNo,
+          { width },
+        ]}
+      />
+    </View>
+  );
+}
+
 function normalizeBet(docSnap) {
   const payload = docSnap.data() || {};
   return {
@@ -129,6 +230,7 @@ function normalizeBet(docSnap) {
     actorId: payload.actorId || payload.ownerId,
     ownerId: payload.ownerId,
     ownerName: payload.ownerName || 'Unknown',
+    betType: payload.betType === 'CALL_OUT' || payload.betType === 'COMMITMENT' ? payload.betType : 'CALL_OUT',
     status: payload.status || 'OPEN',
     proofNote: payload.proofNote || '',
     proofImageUri: payload.proofImageUri || '',
@@ -209,7 +311,30 @@ export default function App() {
   const [disputesByBet, setDisputesByBet] = useState({});
   const [commentsByBet, setCommentsByBet] = useState({});
   const [reactionsByBet, setReactionsByBet] = useState({});
-  const [tab, setTab] = useState('Feed');
+  const [tab, setTab] = useState('Home');
+  const [homeFeedFilter, setHomeFeedFilter] = useState('All');
+  const [commitmentsView, setCommitmentsView] = useState('My Commitments');
+  const [leaderboardMode, setLeaderboardMode] = useState('The Committed');
+  const [leaderboardRange, setLeaderboardRange] = useState('All Time');
+  const [profileSection, setProfileSection] = useState('Overview');
+  const [showCreateBetModal, setShowCreateBetModal] = useState(false);
+  const [showSettingsSheet, setShowSettingsSheet] = useState(false);
+  const [aiDraftLoading, setAiDraftLoading] = useState(false);
+  const [aiPreviewLoading, setAiPreviewLoading] = useState(false);
+  const [aiPreview, setAiPreview] = useState(null);
+  const [selectedVoteByBet, setSelectedVoteByBet] = useState({});
+  const [votingByBet, setVotingByBet] = useState({});
+  const [voteVisualByBet, setVoteVisualByBet] = useState({});
+  const [showCoinBurst, setShowCoinBurst] = useState(false);
+  const [selfMeta, setSelfMeta] = useState({
+    plan: 'free',
+    aiCredits: 8,
+    referralCode: '',
+    referralCount: 0,
+    referredBy: '',
+  });
+  const [referralInput, setReferralInput] = useState('');
+  const [betKind, setBetKind] = useState('CALL_OUT');
   const [betText, setBetText] = useState('');
   const [deadline, setDeadline] = useState('');
   const [deadlineDate, setDeadlineDate] = useState(() => new Date(Date.now() + 60 * 60 * 1000));
@@ -218,7 +343,6 @@ export default function App() {
   const [stakeAmount, setStakeAmount] = useState('0');
   const [proof, setProof] = useState({});
   const [proofImageByBet, setProofImageByBet] = useState({});
-  const [proofVideoByBet, setProofVideoByBet] = useState({});
   const [betAmount, setBetAmount] = useState(DEFAULT_BET);
   const [friendEmail, setFriendEmail] = useState('');
   const [friends, setFriends] = useState([]);
@@ -228,8 +352,32 @@ export default function App() {
   const [recapByUser, setRecapByUser] = useState({});
   const [recapProviderByUser, setRecapProviderByUser] = useState({});
   const [recapLoadingByUser, setRecapLoadingByUser] = useState({});
-  const [coinBurstByBet, setCoinBurstByBet] = useState({});
+  const [predictionChoiceByBet, setPredictionChoiceByBet] = useState({});
+  const [showSocialSheet, setShowSocialSheet] = useState(false);
+  const [profileOverlayUserId, setProfileOverlayUserId] = useState('');
+  const [nowMs, setNowMs] = useState(Date.now());
   const [message, setMessage] = useState('');
+  const scanAnim = useRef(new Animated.Value(0)).current;
+  const shutterAnim = useRef(new Animated.Value(0)).current;
+  const coinBurstAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 30000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.timing(scanAnim, {
+        toValue: 1,
+        duration: 1300,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      })
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [scanAnim]);
 
   useEffect(() => {
     let unsubscribeProfile = () => {};
@@ -264,10 +412,17 @@ export default function App() {
       setNotifications([]);
       setProof({});
       setProofImageByBet({});
-      setProofVideoByBet({});
       setRecapByUser({});
       setRecapProviderByUser({});
       setRecapLoadingByUser({});
+      setSelfMeta({
+        plan: 'free',
+        aiCredits: 8,
+        referralCode: '',
+        referralCount: 0,
+        referredBy: '',
+      });
+      setReferralInput('');
       setMessage('');
       setAuthReady(true);
 
@@ -288,6 +443,11 @@ export default function App() {
             name: actorName,
             email: nextUser.email || '',
             coins: 1000,
+            plan: 'free',
+            aiCredits: 8,
+            referralCode: buildReferralCode(actorName, nextUser.uid),
+            referralCount: 0,
+            referredBy: '',
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
           });
@@ -298,6 +458,19 @@ export default function App() {
         const data = snap.data() || {};
         const name = data.name || actorName;
         const coins = Number.isFinite(data.coins) ? data.coins : 1000;
+        const plan = typeof data.plan === 'string' ? data.plan : 'free';
+        const aiCredits = Number.isFinite(data.aiCredits) ? Math.max(0, data.aiCredits) : 8;
+        const referralCode = typeof data.referralCode === 'string' ? data.referralCode : buildReferralCode(name, nextUser.uid);
+        const referralCount = Number.isFinite(data.referralCount) ? Math.max(0, data.referralCount) : 0;
+        const referredBy = typeof data.referredBy === 'string' ? data.referredBy : '';
+        setSelfMeta({ plan, aiCredits, referralCode, referralCount, referredBy });
+        if (!data.referralCode) {
+          setDoc(
+            userRef,
+            { referralCode, updatedAt: serverTimestamp() },
+            { merge: true }
+          ).catch(() => {});
+        }
         const baseUsers = createUsersForActor(nextUser.uid, name);
         setUsers(withSelfCoins(baseUsers, coins));
       });
@@ -462,6 +635,37 @@ export default function App() {
   const myBets = bets.filter((b) => b.ownerId === selfId);
   const friendIds = new Set(friends.map((f) => f.friendId || f.id));
   const friendFeedBets = bets.filter((b) => friendIds.has(b.ownerId));
+  const homeFeedBets = useMemo(() => {
+    const mineAndFriends = [...myBets, ...friendFeedBets];
+    const deduped = Array.from(new Map(mineAndFriends.map((bet) => [bet.id, bet])).values());
+    const merged = deduped
+      .map((bet) => ({ ...bet, homeType: inferBetType(bet, selfId) }))
+      .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
+    if (homeFeedFilter === 'Call Outs') return merged.filter((bet) => bet.homeType === 'CALL_OUT');
+    if (homeFeedFilter === 'Commitments') return merged.filter((bet) => bet.homeType === 'COMMITMENT');
+    return merged;
+  }, [friendFeedBets, myBets, homeFeedFilter, selfId]);
+  const backingBets = useMemo(() => {
+    if (!selfId) return [];
+    return friendFeedBets.filter((bet) => bet.ownerId !== selfId);
+  }, [friendFeedBets, selfId]);
+  const commitmentsFeed = useMemo(
+    () =>
+      (commitmentsView === 'My Commitments' ? myBets : backingBets).filter(
+        (bet) => inferBetType(bet, selfId) === 'COMMITMENT'
+      ),
+    [backingBets, commitmentsView, myBets, selfId]
+  );
+  const leaderboardWindowMs = useMemo(() => {
+    if (leaderboardRange === 'This Week') return 7 * 24 * 60 * 60 * 1000;
+    if (leaderboardRange === 'This Month') return 30 * 24 * 60 * 60 * 1000;
+    return 0;
+  }, [leaderboardRange]);
+  const rangeBets = useMemo(() => {
+    if (!leaderboardWindowMs) return bets;
+    const cutoff = Date.now() - leaderboardWindowMs;
+    return bets.filter((bet) => (bet.createdAtMs || 0) >= cutoff);
+  }, [bets, leaderboardWindowMs]);
   const knownUserIds = useMemo(() => {
     const fromBets = bets.map((b) => b.ownerId).filter(Boolean);
     const fromFriends = friends.map((f) => f.friendId || f.id).filter(Boolean);
@@ -475,6 +679,135 @@ export default function App() {
     });
     return next;
   }, [bets, knownUserIds]);
+
+  const selfStats = useMemo(
+    () => (selfId ? ownerStatsByUser[selfId] || computeUserHistoryStats(bets, selfId) : null),
+    [bets, ownerStatsByUser, selfId]
+  );
+  const selfStreak = useMemo(() => (selfId ? computeStreak(bets, selfId) : 0), [bets, selfId]);
+  const leaderboardRows = useMemo(() => {
+    return knownUserIds
+      .map((userId) => {
+        const stats = ownerStatsByUser[userId] || computeUserHistoryStats(bets, userId);
+        const rate = predictPassOddsFromHistory(stats);
+        return {
+          userId,
+          name: getDisplayNameForUser(userId),
+          rate,
+          wins: stats.passCount,
+          total: stats.totalBets,
+          resolved: stats.resolvedCount,
+        };
+      })
+      .sort((a, b) => b.rate - a.rate);
+  }, [knownUserIds, ownerStatsByUser]);
+  const committedRows = useMemo(() => {
+    return knownUserIds
+      .map((userId) => {
+        const stats = computeUserHistoryStats(rangeBets, userId);
+        const rate = predictPassOddsFromHistory(stats);
+        return {
+          userId,
+          name: getDisplayNameForUser(userId),
+          score: Math.max(0, Math.min(100, Math.round(rate))),
+          metricLabel: 'completion',
+          subLabel: `${stats.totalBets} commitments`,
+        };
+      })
+      .filter((row) => row.subLabel !== '0 commitments')
+      .sort((a, b) => b.score - a.score);
+  }, [knownUserIds, rangeBets]);
+  const prophetRows = useMemo(() => {
+    const rows = {};
+    rangeBets.forEach((bet) => {
+      if (bet.status !== 'SETTLED') return;
+      const expectedSide = bet.aiVerdict === 'PASS' ? 'YES' : bet.aiVerdict === 'FAIL' ? 'NO' : '';
+      if (!expectedSide) return;
+      const predictions = predictionsByBet[bet.id] || [];
+      predictions.forEach((prediction) => {
+        const userId = prediction.userId;
+        if (!userId) return;
+        if (!rows[userId]) {
+          rows[userId] = {
+            userId,
+            name: getDisplayNameForUser(userId),
+            correct: 0,
+            total: 0,
+          };
+        }
+        rows[userId].total += 1;
+        if (prediction.side === expectedSide) rows[userId].correct += 1;
+      });
+    });
+    return Object.values(rows)
+      .map((row) => ({
+        userId: row.userId,
+        name: row.name,
+        score: row.total > 0 ? Math.max(0, Math.min(100, Math.round((row.correct / row.total) * 100))) : 0,
+        metricLabel: 'accuracy',
+        subLabel: `${row.total} predictions`,
+      }))
+      .filter((row) => row.subLabel !== '0 predictions')
+      .sort((a, b) => b.score - a.score);
+  }, [rangeBets, predictionsByBet]);
+  const activeLeaderboardRows = leaderboardMode === 'The Committed' ? committedRows : prophetRows;
+  const selfLeaderboardRow = activeLeaderboardRows.find((row) => row.userId === selfId) || null;
+  const profileRate = Math.max(0, Math.min(100, Math.round(predictPassOddsFromHistory(selfStats || {}))));
+  const profileNoVotes = useMemo(() => {
+    return myBets.reduce((count, bet) => {
+      const predictions = predictionsByBet[bet.id] || [];
+      return count + predictions.filter((prediction) => prediction.side === 'NO').length;
+    }, 0);
+  }, [myBets, predictionsByBet]);
+  const weeklyRoast = useMemo(() => {
+    const total = selfStats?.totalBets || 0;
+    const kept = selfStats?.passCount || 0;
+    return `"You made ${total} commitments this week. Completed ${kept}. Friends bet against you ${profileNoVotes} times. Keep your streak alive before they start calling it a fluke."`;
+  }, [profileNoVotes, selfStats]);
+  const personalityTags = useMemo(() => {
+    const mine = myBets || [];
+    const tagCount = { Fitness: 0, 'Wake Up': 0, Learning: 0, Build: 0, Challenge: 0 };
+    mine.forEach((bet) => {
+      const tag = getBetTag(bet.text);
+      tagCount[tag] = (tagCount[tag] || 0) + 1;
+    });
+    const mapped = [];
+    if ((tagCount.Fitness || 0) >= 2) mapped.push('Gym Rat');
+    if ((tagCount['Wake Up'] || 0) >= 2) mapped.push('Early Bird');
+    if ((tagCount.Learning || 0) >= 2) mapped.push('Study Beast');
+    if ((tagCount.Build || 0) >= 2) mapped.push('Builder');
+    if ((selfStats?.failCount || 0) > 0 && (selfStats?.passCount || 0) >= (selfStats?.failCount || 0)) {
+      mapped.push('Comeback Specialist');
+    }
+    if (mapped.length === 0) mapped.push('Consistency Starter');
+    return mapped.slice(0, 3);
+  }, [myBets, selfStats]);
+  const selfRecap = selfId ? recapByUser[selfId] : '';
+  const selfRecapLoading = selfId ? recapLoadingByUser[selfId] : false;
+
+  const profileOverlayData = useMemo(() => {
+    if (!profileOverlayUserId) return null;
+    const stats = ownerStatsByUser[profileOverlayUserId] || computeUserHistoryStats(bets, profileOverlayUserId);
+    const totalResolved = Math.max(1, stats.passCount + stats.failCount);
+    const successRate = Math.round((stats.passCount / totalResolved) * 100);
+    const recentProofs = bets
+      .filter((b) => b.ownerId === profileOverlayUserId && (b.victoryPosterUri || b.proofImageUri))
+      .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
+      .slice(0, 6);
+    const fromFriend = friends.find((f) => (f.friendId || f.id) === profileOverlayUserId);
+    const fromBet = bets.find((b) => b.ownerId === profileOverlayUserId && b.ownerName);
+    const name =
+      profileOverlayUserId === selfId
+        ? resolveActorName(authUser)
+        : fromFriend?.name || fromBet?.ownerName || profileOverlayUserId;
+    return {
+      userId: profileOverlayUserId,
+      name,
+      successRate,
+      totalWins: stats.passCount,
+      recentProofs,
+    };
+  }, [authUser, bets, friends, ownerStatsByUser, profileOverlayUserId, selfId]);
 
   const handleAuth = async () => {
     if (!email.trim() || !password.trim()) {
@@ -498,6 +831,11 @@ export default function App() {
               name: nextName,
               email: cred.user.email || email.trim(),
               coins: 1000,
+              plan: 'free',
+              aiCredits: 8,
+              referralCode: buildReferralCode(nextName, cred.user.uid),
+              referralCount: 0,
+              referredBy: '',
               createdAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
             },
@@ -564,16 +902,18 @@ export default function App() {
     });
   }, [authUser, bets, selfId]);
 
-  const getDisplayNameForUser = (userId) => {
+  function getDisplayNameForUser(userId) {
     if (!userId) return 'Unknown';
     if (userId === selfId) return resolveActorName(authUser);
     const fromFriend = friends.find((f) => (f.friendId || f.id) === userId);
     if (fromFriend?.name) return fromFriend.name;
     const fromBet = bets.find((b) => b.ownerId === userId && b.ownerName);
     return fromBet?.ownerName || userId;
-  };
+  }
 
   const generateRecapForUser = async (userId) => {
+    const creditOk = await consumeAiCredit('AI recap');
+    if (!creditOk) return;
     const stats = ownerStatsByUser[userId] || computeUserHistoryStats(bets, userId);
     const odds = predictPassOddsFromHistory(stats);
     const userName = getDisplayNameForUser(userId);
@@ -690,11 +1030,133 @@ export default function App() {
     if (!selfId) return;
     try {
       const inviteLink = `https://betonme.app/invite?ref=${selfId}`;
+      const referralCode = selfMeta.referralCode ? `\nReferral code: ${selfMeta.referralCode}` : '';
       await Share.share({
-        message: `Join me on Bet On Me: ${inviteLink}`,
+        message: `Join me on Betme: ${inviteLink}${referralCode}`,
       });
     } catch (error) {
       setMessage(error?.message || 'Failed to share invite.');
+    }
+  };
+
+  const shareProfileSnapshot = async () => {
+    try {
+      await Share.share({
+        message: `${resolveActorName(authUser)} on Betme\nCoins: ${self?.coins || 0}\nStreak: ${selfStreak}\nSuccess Rate: ${profileRate}%\nReferral: ${selfMeta.referralCode || 'N/A'}`,
+      });
+    } catch (error) {
+      setMessage(error?.message || 'Failed to share profile snapshot.');
+    }
+  };
+
+  const consumeAiCredit = async (featureName) => {
+    if (!selfId) return false;
+    if (selfMeta.plan === 'pro') return true;
+    try {
+      const userRef = doc(db, 'users', selfId);
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(userRef);
+        const payload = snap.data() || {};
+        const current = Number.isFinite(payload.aiCredits) ? payload.aiCredits : 0;
+        if (current <= 0) {
+          throw new Error(`No AI credits left for ${featureName}. Buy credits or upgrade to Pro.`);
+        }
+        tx.update(userRef, {
+          aiCredits: current - 1,
+          updatedAt: serverTimestamp(),
+        });
+      });
+      return true;
+    } catch (error) {
+      setMessage(error?.message || 'Unable to use AI credit.');
+      return false;
+    }
+  };
+
+  const upgradeToPro = async () => {
+    if (!selfId) return;
+    try {
+      await updateDoc(doc(db, 'users', selfId), {
+        plan: 'pro',
+        updatedAt: serverTimestamp(),
+      });
+      setMessage('Pro plan activated (demo flow).');
+    } catch (error) {
+      setMessage(error?.message || 'Failed to activate Pro.');
+    }
+  };
+
+  const buyAiCreditPack = async () => {
+    if (!selfId || !self) return;
+    const coinCost = 200;
+    const creditPack = 10;
+    if ((self.coins || 0) < coinCost) {
+      setMessage('Not enough coins to buy AI credit pack.');
+      return;
+    }
+    try {
+      await updateDoc(doc(db, 'users', selfId), {
+        coins: Math.max(0, (self.coins || 0) - coinCost),
+        aiCredits: (selfMeta.aiCredits || 0) + creditPack,
+        updatedAt: serverTimestamp(),
+      });
+      setMessage(`Bought ${creditPack} AI credits for ${coinCost} coins.`);
+    } catch (error) {
+      setMessage(error?.message || 'Failed to buy AI credits.');
+    }
+  };
+
+  const applyReferralCode = async () => {
+    const code = referralInput.trim().toUpperCase();
+    if (!selfId || !code) {
+      setMessage('Enter a referral code.');
+      return;
+    }
+    if (selfMeta.referredBy) {
+      setMessage('Referral already claimed on this account.');
+      return;
+    }
+    if (code === selfMeta.referralCode) {
+      setMessage('You cannot use your own referral code.');
+      return;
+    }
+    try {
+      const q = query(collection(db, 'users'), where('referralCode', '==', code), limit(1));
+      const snaps = await getDocs(q);
+      if (snaps.empty) {
+        setMessage('Referral code not found.');
+        return;
+      }
+      const owner = snaps.docs[0];
+      if (owner.id === selfId) {
+        setMessage('You cannot use your own referral code.');
+        return;
+      }
+      await runTransaction(db, async (tx) => {
+        const meRef = doc(db, 'users', selfId);
+        const ownerRef = doc(db, 'users', owner.id);
+        const meSnap = await tx.get(meRef);
+        const ownerSnap = await tx.get(ownerRef);
+        const me = meSnap.data() || {};
+        const ownerPayload = ownerSnap.data() || {};
+        if (me.referredBy) {
+          throw new Error('Referral already claimed.');
+        }
+        tx.update(meRef, {
+          referredBy: code,
+          coins: (Number.isFinite(me.coins) ? me.coins : 0) + 150,
+          updatedAt: serverTimestamp(),
+        });
+        tx.update(ownerRef, {
+          referralCount: (Number.isFinite(ownerPayload.referralCount) ? ownerPayload.referralCount : 0) + 1,
+          coins: (Number.isFinite(ownerPayload.coins) ? ownerPayload.coins : 0) + 150,
+          updatedAt: serverTimestamp(),
+        });
+      });
+      setReferralInput('');
+      setMessage('Referral applied. Both users received 150 coins.');
+    } catch (error) {
+      setMessage(error?.message || 'Failed to apply referral code.');
     }
   };
 
@@ -716,15 +1178,16 @@ export default function App() {
 
   const pickProofImage = async (betId) => {
     try {
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
       if (!permission.granted) {
-        setMessage('Photo library permission denied.');
+        setMessage('Camera permission denied.');
         return;
       }
 
-      const result = await ImagePicker.launchImageLibraryAsync({
+      const result = await ImagePicker.launchCameraAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         quality: 0.6,
+        cameraType: ImagePicker.CameraType.back,
       });
 
       if (result.canceled || !result.assets?.length) return;
@@ -739,46 +1202,26 @@ export default function App() {
     }
   };
 
-  const pickProofVideo = async (betId) => {
-    try {
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
-        setMessage('Photo/video library permission denied.');
-        return;
-      }
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Videos,
-        quality: 0.6,
-        videoMaxDuration: 3,
-      });
-      if (result.canceled || !result.assets?.length) return;
-      const uri = result.assets[0].uri;
-      setProofVideoByBet((prev) => ({ ...prev, [betId]: uri }));
-    } catch (error) {
-      setMessage(error?.message || 'Failed to pick proof video.');
-    }
-  };
-
   const createNewBet = async () => {
     if (!authUser?.uid) {
       setMessage('Please log in first.');
-      return;
+      return false;
     }
 
     if (!betText.trim() || !deadline.trim()) {
       setMessage('Add both bet text and deadline.');
-      return;
+      return false;
     }
 
     const deadlineMs = parseDeadlineToMs(deadline.trim());
     if (!Number.isFinite(deadlineMs)) {
       setMessage('Invalid deadline. Use format: YYYY-MM-DD HH:mm');
-      return;
+      return false;
     }
 
     if (deadlineMs <= Date.now()) {
       setMessage('Deadline must be in the future.');
-      return;
+      return false;
     }
 
     try {
@@ -790,7 +1233,7 @@ export default function App() {
       const stake = Math.max(0, Number(stakeAmount) || 0);
       if (stake > (self?.coins || 0)) {
         setMessage('Stake exceeds your wallet balance.');
-        return;
+        return false;
       }
 
       const synthesis = await synthesizeBet({
@@ -807,13 +1250,12 @@ export default function App() {
         yesPool: 0,
         noPool: 0,
       });
-      const secretGesture = generateSecretGesture({ userName: resolveActorName(authUser) });
-
       await setDoc(doc(db, 'bets', base.id), {
         id: base.id,
         ownerId: authUser.uid,
         ownerName: resolveActorName(authUser),
         actorId: authUser.uid,
+        betType: betKind,
         text: synthesis.formattedBet || base.text,
         deadlineISO: base.deadlineISO,
         status: 'OPEN',
@@ -824,7 +1266,7 @@ export default function App() {
         aiBookieComment: bookie,
         aiDisputeSummary: '',
         aiDisputeProvider: '',
-        secretGesture,
+        secretGesture: '',
         ownerStake: stake,
         ownerStakeMultiplier: 1.8,
         nudgeSentAtMs: 0,
@@ -875,28 +1317,104 @@ export default function App() {
       setShowDeadlinePicker(false);
       setDeadlinePickerMode('date');
       setStakeAmount('0');
+      setBetKind('CALL_OUT');
+      setAiPreview(null);
       setMessage('Bet posted with AI synthesis.');
+      return true;
     } catch (error) {
       setMessage(error?.message || 'Failed to create bet.');
+      return false;
     }
+  };
+
+  const runAiDraftBet = async () => {
+    if (!betText.trim()) {
+      setMessage('Write a rough commitment first.');
+      return;
+    }
+    const resolvedDeadline = deadline.trim() || formatDeadlineInput(deadlineDate);
+    const deadlineMs = parseDeadlineToMs(resolvedDeadline);
+    if (!Number.isFinite(deadlineMs)) {
+      setMessage('Pick a valid deadline first.');
+      return;
+    }
+    const creditOk = await consumeAiCredit('AI draft');
+    if (!creditOk) return;
+    setAiDraftLoading(true);
+    try {
+      const stats = computeUserHistoryStats(bets, authUser?.uid || '');
+      const odds = predictPassOddsFromHistory(stats);
+      const synthesis = await synthesizeBet({
+        rawText: betText.trim(),
+        deadlineISO: resolvedDeadline,
+        ownerName: resolveActorName(authUser),
+        odds,
+      });
+      setBetText(synthesis.formattedBet || betText.trim());
+      setMessage(`AI draft ready (${synthesis.provider || 'fallback'}).`);
+    } catch (error) {
+      setMessage(error?.message || 'AI draft failed.');
+    } finally {
+      setAiDraftLoading(false);
+    }
+  };
+
+  const runAiBetPreview = async () => {
+    if (!betText.trim()) {
+      setMessage('Add bet text first.');
+      return;
+    }
+    const creditOk = await consumeAiCredit('AI preview');
+    if (!creditOk) return;
+    setAiPreviewLoading(true);
+    try {
+      const trueOddsMeta = computeTrueOddsFromLastTen(bets, authUser?.uid || '');
+      const selfStatsSnapshot = computeUserHistoryStats(bets, authUser?.uid || '');
+      const selfOdds = trueOddsMeta.odds || predictPassOddsFromHistory(selfStatsSnapshot);
+      const bookie = await generateBookieComment({
+        ownerName: resolveActorName(authUser),
+        odds: selfOdds,
+        passCount: trueOddsMeta.pass,
+        failCount: trueOddsMeta.fail,
+        yesPool: 0,
+        noPool: 0,
+      });
+      setAiPreview({
+        odds: Math.round(selfOdds),
+        riskLabel: trueOddsMeta.riskLabel,
+        bookie,
+      });
+    } catch (error) {
+      setMessage(error?.message || 'AI preview failed.');
+    } finally {
+      setAiPreviewLoading(false);
+    }
+  };
+
+  const openCreateBetModal = () => {
+    if (!deadline.trim()) {
+      setDeadline(formatDeadlineInput(deadlineDate));
+    }
+    setAiPreview(null);
+    setShowCreateBetModal(true);
   };
 
   const placePrediction = async (betId, side) => {
     if (!authUser?.uid) {
       setMessage('Please log in first.');
-      return;
+      return false;
     }
 
     const targetBet = bets.find((b) => b.id === betId);
     if (targetBet?.ownerId === authUser.uid) {
       setMessage('You cannot predict on your own bet.');
-      return;
+      return false;
     }
 
     const amount = Number(betAmount);
     if (!Number.isFinite(amount) || amount <= 0) {
       setMessage('Enter a valid prediction amount.');
-      return;
+      return false;
     }
 
     try {
@@ -951,21 +1469,98 @@ export default function App() {
       });
 
       setMessage(`You predicted ${side}.`);
+      return true;
     } catch (error) {
       setMessage(error?.message || 'Failed to place prediction.');
+      return false;
     }
   };
 
-  const handlePredictionTap = (betId, side) => {
-    setCoinBurstByBet((prev) => ({ ...prev, [betId]: side }));
+  const submitVoteWithFeedback = async (betId, side) => {
+    const target = bets.find((bet) => bet.id === betId);
+    const baseRatio = target?.poolTotal > 0 ? target.poolYes / target.poolTotal : 0.5;
+    const nextRatio = side === 'YES'
+      ? Math.min(0.92, baseRatio + 0.18)
+      : Math.max(0.08, baseRatio - 0.18);
+    setVoteVisualByBet((prev) => ({
+      ...prev,
+      [betId]: {
+        ratio: nextRatio,
+        glowYes: side === 'YES',
+        flashNo: side === 'NO',
+      },
+    }));
+    Vibration.vibrate(side === 'YES' ? 18 : 24);
+    if (side === 'YES') {
+      setShowCoinBurst(true);
+      coinBurstAnim.setValue(0);
+      Animated.sequence([
+        Animated.timing(coinBurstAnim, {
+          toValue: 1,
+          duration: 180,
+          easing: Easing.out(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(coinBurstAnim, {
+          toValue: 0,
+          duration: 520,
+          easing: Easing.in(Easing.quad),
+          useNativeDriver: true,
+        }),
+      ]).start(() => setShowCoinBurst(false));
+    }
     setTimeout(() => {
-      setCoinBurstByBet((prev) => {
+      setVoteVisualByBet((prev) => {
         const next = { ...prev };
         delete next[betId];
         return next;
       });
-    }, 650);
+    }, 900);
+
+    setSelectedVoteByBet((prev) => ({ ...prev, [betId]: side }));
+    setVotingByBet((prev) => ({ ...prev, [betId]: true }));
+    const ok = await placePrediction(betId, side);
+    setVotingByBet((prev) => ({ ...prev, [betId]: false }));
+    if (ok) {
+      setMessage(`Vote ${side} placed.`);
+    }
+  };
+
+  const handlePredictionTap = (betId, side) => {
+    setPredictionChoiceByBet((prev) => ({
+      ...prev,
+      [betId]: side,
+    }));
+  };
+
+  const submitPredictionChoice = (betId) => {
+    const side = predictionChoiceByBet[betId];
+    if (!side) {
+      setMessage('Select YES or NO first.');
+      return;
+    }
+    setPredictionChoiceByBet((prev) => {
+      const next = { ...prev };
+      delete next[betId];
+      return next;
+    });
     placePrediction(betId, side);
+  };
+
+  const submitEvidenceWithShutter = (betId) => {
+    Animated.sequence([
+      Animated.timing(shutterAnim, {
+        toValue: 1,
+        duration: 120,
+        useNativeDriver: true,
+      }),
+      Animated.timing(shutterAnim, {
+        toValue: 0,
+        duration: 220,
+        useNativeDriver: true,
+      }),
+    ]).start();
+    submitProof(betId);
   };
 
   const submitProof = async (betId) => {
@@ -975,7 +1570,6 @@ export default function App() {
 
     const note = proof[betId] || '';
     const imageUri = proofImageByBet[betId] || '';
-    const videoUri = proofVideoByBet[betId] || '';
     const target = bets.find((b) => b.id === betId);
 
     if (!target || target.status !== 'OPEN') {
@@ -988,12 +1582,7 @@ export default function App() {
     }
 
     if (!imageUri) {
-      setMessage('Proof image is required before AI submission.');
-      return;
-    }
-
-    if (!videoUri) {
-      setMessage('3-second liveness video is required.');
+      setMessage('Proof photo is required for AI verification.');
       return;
     }
 
@@ -1016,8 +1605,8 @@ export default function App() {
       const aiResult = await judgeProof({
         note,
         imageUri,
-        videoUri,
-        secretGesture: target.secretGesture,
+        videoUri: '',
+        secretGesture: '',
         betText: target.text,
         deadlineISO: target.deadlineISO,
       });
@@ -1046,7 +1635,7 @@ export default function App() {
         reviewStatus: 'AUTO_RESOLVED',
         proofNote: note,
         proofImageUri: imageUri || '',
-        proofVideoUri: videoUri || '',
+        proofVideoUri: '',
         victoryPosterUri: posterUriToStore,
         victoryPosterStyle: posterResult.style || '',
         victoryPosterProvider: posterResult.provider || 'fallback',
@@ -1291,7 +1880,7 @@ export default function App() {
       <SafeAreaView style={styles.safe}>
         <StatusBar style="light" />
         <View style={styles.centerWrap}>
-          <Text style={styles.title}>Bet On Me</Text>
+          <Text style={styles.title}>Betme</Text>
           <Text style={styles.dimText}>Loading authentication...</Text>
         </View>
       </SafeAreaView>
@@ -1303,7 +1892,7 @@ export default function App() {
       <SafeAreaView style={styles.safe}>
         <StatusBar style="light" />
         <ScrollView contentContainerStyle={styles.container}>
-          <Text style={styles.title}>Bet On Me</Text>
+          <Text style={styles.title}>Betme</Text>
           <Text style={styles.subtitle}>Create an account to tie bets and coins to your identity.</Text>
 
           <View style={styles.card}>
@@ -1327,7 +1916,7 @@ export default function App() {
                 value={nameInput}
                 onChangeText={setNameInput}
                 placeholder="Display name"
-                placeholderTextColor="#62B862"
+                placeholderTextColor="#7F73A3"
                 style={styles.input}
               />
             )}
@@ -1336,7 +1925,7 @@ export default function App() {
               value={email}
               onChangeText={setEmail}
               placeholder="Email"
-              placeholderTextColor="#62B862"
+              placeholderTextColor="#7F73A3"
               style={styles.input}
               autoCapitalize="none"
               keyboardType="email-address"
@@ -1345,7 +1934,7 @@ export default function App() {
               value={password}
               onChangeText={setPassword}
               placeholder="Password"
-              placeholderTextColor="#62B862"
+              placeholderTextColor="#7F73A3"
               style={styles.input}
               secureTextEntry
             />
@@ -1368,33 +1957,703 @@ export default function App() {
       <StatusBar style="light" />
       <View style={styles.appShell}>
         <ScrollView contentContainerStyle={styles.container}>
-          <Text style={styles.title}>Bet On Me</Text>
-          <Text style={styles.subtitle}>Futuristic social accountability, powered by your friends.</Text>
+          {tab === 'Home' && (
+            <View style={styles.homeTopRow}>
+              <Text style={styles.brandTitle}>Betme</Text>
+              <View style={styles.homeTopStats}>
+                <View style={[styles.headerChip, styles.coinChipWrap]}>
+                  <Text style={styles.headerChipText}>Coin {self?.coins || 0}</Text>
+                  {showCoinBurst && (
+                    <Animated.Text
+                      style={[
+                        styles.coinBurstText,
+                        {
+                          opacity: coinBurstAnim,
+                          transform: [
+                            {
+                              translateY: coinBurstAnim.interpolate({
+                                inputRange: [0, 1],
+                                outputRange: [8, -12],
+                              }),
+                            },
+                          ],
+                        },
+                      ]}
+                    >
+                      +🪙
+                    </Animated.Text>
+                  )}
+                </View>
+                <View style={styles.headerChip}>
+                  <Text style={styles.headerChipText}>Fire {selfStreak}</Text>
+                </View>
+              </View>
+            </View>
+          )}
 
-          <View style={styles.headerRow}>
-            <Text style={styles.meta}>Signed in as: {resolveActorName(authUser)}</Text>
-            <Pressable style={styles.smallBtnAlt} onPress={handleLogout}>
-              <Text style={styles.smallBtnText}>Logout</Text>
-            </Pressable>
-          </View>
+          {tab !== 'Home' && tab !== 'Commitments' && tab !== 'Leaderboard' && tab !== 'Profile' && tab !== 'Notifications' && (
+            <View style={styles.headerRow}>
+              <View>
+                <Text style={styles.title}>Betme</Text>
+                <Text style={styles.meta}>@{resolveActorName(authUser)}</Text>
+                <Text style={styles.meta}>Coins: {self?.coins || 0}</Text>
+              </View>
+              <View style={styles.headerActions}>
+                <View style={styles.streakPill}>
+                  <Text style={styles.streakPillText}>Fire {selfStreak}</Text>
+                </View>
+                <Pressable style={styles.bellBtn} onPress={() => setShowSettingsSheet(true)}>
+                  <Text style={styles.smallBtnText}>Bell</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
 
-        {tab === 'Feed' && (
+        {tab === 'Home' && (
           <View>
-            <Text style={styles.feedHeading}>Feed</Text>
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Post a Bet</Text>
+            <View style={styles.homeActionRow}>
+              <Pressable style={styles.createBetBtn} onPress={openCreateBetModal}>
+                <Text style={styles.createBetBtnText}>Create Bet</Text>
+              </Pressable>
+              <TextInput
+                value={betAmount}
+                onChangeText={setBetAmount}
+                keyboardType="number-pad"
+                placeholder="Vote amount"
+                placeholderTextColor="#7F73A3"
+                style={styles.homeAmountInput}
+              />
+            </View>
+            <View style={styles.homeTabs}>
+              {['All', 'Call Outs', 'Commitments'].map((filter) => {
+                const selected = homeFeedFilter === filter;
+                return (
+                  <Pressable
+                    key={filter}
+                    style={[styles.homeTabBtn, selected && styles.homeTabBtnActive]}
+                    onPress={() => setHomeFeedFilter(filter)}
+                  >
+                    <Text style={[styles.homeTabText, selected && styles.homeTabTextActive]}>{filter}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            <View style={styles.mockFeedWrap}>
+              {homeFeedBets.length === 0 && (
+                <View style={styles.card}>
+                  <Text style={styles.dimText}>No bets yet. Tap Commitments tab to post your first one.</Text>
+                </View>
+              )}
+
+              {homeFeedBets.map((bet) => {
+                const predictions = predictionsByBet[bet.id] || [];
+                const myPrediction = predictions.find((p) => p.userId === selfId);
+                const proofDeadlinePassed =
+                  bet.proofDeadlineAtMs > 0 && Date.now() > bet.proofDeadlineAtMs;
+                const yesBacker = predictions.find((prediction) => prediction.side === 'YES');
+                const noBacker = predictions.find((prediction) => prediction.side === 'NO');
+                const canVote =
+                  bet.status === 'OPEN' &&
+                  bet.ownerId !== selfId &&
+                  !myPrediction &&
+                  !proofDeadlinePassed;
+                const selectedSide = selectedVoteByBet[bet.id];
+                const voteLoading = !!votingByBet[bet.id];
+                const voteVisual = voteVisualByBet[bet.id];
+                const baseRatio = bet.poolTotal > 0 ? bet.poolYes / bet.poolTotal : 0.5;
+                const ratio = Number.isFinite(voteVisual?.ratio) ? voteVisual.ratio : baseRatio;
+                const oddsYes = Math.round(baseRatio * 100);
+                const oddsNo = 100 - oddsYes;
+                const statusTag = bet.status === 'OPEN' ? (myPrediction ? 'Voted' : 'Active') : 'Closed';
+                const timeText = formatTimeRemaining(bet.proofDeadlineAtMs, nowMs);
+                const category = getBetTag(bet.text);
+
+                return (
+                  <View key={bet.id} style={[styles.mockCard, voteVisual?.flashNo && styles.mockCardFlashNo]}>
+                    <View style={styles.mockCardHeader}>
+                      <View style={styles.mockAvatar}>
+                        <Text style={styles.mockAvatarText}>{getInitials(bet.ownerName)}</Text>
+                      </View>
+                      <View style={styles.mockOwnerText}>
+                        <Text style={styles.mockOwnerName}>{bet.ownerName}</Text>
+                        <Text style={styles.mockOwnerHandle}>{toHandle(bet.ownerName)}</Text>
+                      </View>
+                      <View style={styles.mockTypePill}>
+                        <Text style={styles.mockTypePillText}>
+                          {bet.homeType === 'COMMITMENT' ? 'COMMITMENT' : 'CALL OUT'}
+                        </Text>
+                      </View>
+                    </View>
+
+                    <Text style={styles.mockBetTitle}>{cleanBetCardTitle(bet.text)}</Text>
+
+                    <View style={styles.mockTagsRow}>
+                      <View style={styles.mockSoftTag}>
+                        <Text style={styles.mockSoftTagText}>{category}</Text>
+                      </View>
+                      <View style={[styles.mockSoftTag, styles.mockStatusTag]}>
+                        <Text style={styles.mockStatusTagText}>{statusTag}</Text>
+                      </View>
+                      <View style={styles.mockTimeWrap}>
+                        <Text style={styles.mockTimeText}>{timeText}</Text>
+                      </View>
+                    </View>
+
+                    <View style={styles.mockPoolGrid}>
+                      <View style={[styles.mockPoolCard, styles.mockPoolYes]}>
+                        <Text style={styles.mockPoolLabel}>YES POOL</Text>
+                        <Text style={styles.mockPoolAmount}>Coin {bet.poolYes || 0}</Text>
+                        <Text style={styles.mockPoolUser}>{yesBacker?.userName || 'No backers'}</Text>
+                      </View>
+                      <View style={[styles.mockPoolCard, styles.mockPoolNo]}>
+                        <Text style={styles.mockPoolLabel}>NO POOL</Text>
+                        <Text style={styles.mockPoolAmount}>Coin {bet.poolNo || 0}</Text>
+                        <Text style={styles.mockPoolUser}>{noBacker?.userName || 'No backers'}</Text>
+                      </View>
+                    </View>
+                    <View style={styles.voteLiquidTrack}>
+                      <Animated.View
+                        style={[
+                          styles.voteLiquidFill,
+                          {
+                            width: `${(ratio * 100).toFixed(0)}%`,
+                          },
+                          voteVisual?.glowYes ? styles.voteLiquidFillYesGlow : styles.voteLiquidFillDefault,
+                          voteVisual?.flashNo && styles.voteLiquidFillNo,
+                        ]}
+                      />
+                    </View>
+                    <Text style={styles.voteOddsText}>{`Odds now: YES ${oddsYes}% | NO ${oddsNo}%`}</Text>
+
+                    {canVote && (
+                      <View style={styles.mockActionRow}>
+                        <Pressable
+                          style={[
+                            styles.mockVoteYesBtn,
+                            selectedSide === 'YES' && styles.mockVoteYesBtnActive,
+                            voteLoading && styles.mockVoteBtnDisabled,
+                          ]}
+                          onPress={() => submitVoteWithFeedback(bet.id, 'YES')}
+                          disabled={voteLoading}
+                        >
+                          <Text style={styles.mockVoteYesText}>
+                            {voteLoading && selectedSide === 'YES' ? 'Voting...' : selectedSide === 'YES' ? 'Selected' : 'Vote Yes'}
+                          </Text>
+                        </Pressable>
+                        <Pressable
+                          style={[
+                            styles.mockVoteNoBtn,
+                            selectedSide === 'NO' && styles.mockVoteNoBtnActive,
+                            voteLoading && styles.mockVoteBtnDisabled,
+                          ]}
+                          onPress={() => submitVoteWithFeedback(bet.id, 'NO')}
+                          disabled={voteLoading}
+                        >
+                          <Text style={styles.mockVoteNoText}>
+                            {voteLoading && selectedSide === 'NO' ? 'Voting...' : selectedSide === 'NO' ? 'Selected' : 'Vote No'}
+                          </Text>
+                        </Pressable>
+                      </View>
+                    )}
+                    {!canVote && myPrediction && (
+                      <Text style={styles.mockVoteMeta}>You voted {myPrediction.side} ({myPrediction.amount})</Text>
+                    )}
+                  </View>
+                );
+              })}
+            </View>
+          </View>
+        )}
+        {tab === 'Commitments' && (
+          <View>
+            <Text style={styles.screenTitle}>Commitments</Text>
+            <View style={styles.screenSegment}>
+              {['My Commitments', 'Backing'].map((item) => {
+                const active = commitmentsView === item;
+                return (
+                  <Pressable
+                    key={item}
+                    style={[styles.screenSegmentBtn, active && styles.screenSegmentBtnActive]}
+                    onPress={() => setCommitmentsView(item)}
+                  >
+                    <Text style={[styles.screenSegmentText, active && styles.screenSegmentTextActive]}>{item}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <View style={styles.sectionRule} />
+
+            {commitmentsFeed.length === 0 && (
+              <View style={styles.card}>
+                <Text style={styles.dimText}>No items yet in this section.</Text>
+              </View>
+            )}
+
+            {commitmentsFeed.map((bet) => {
+              const predictions = predictionsByBet[bet.id] || [];
+              const myPrediction = predictions.find((prediction) => prediction.userId === selfId);
+              const isOpen = bet.status === 'OPEN' && (bet.proofDeadlineAtMs <= 0 || nowMs <= bet.proofDeadlineAtMs);
+              const canVote = commitmentsView === 'Backing' && isOpen && !myPrediction && bet.ownerId !== selfId;
+              const selectedSide = selectedVoteByBet[bet.id];
+              const voteLoading = !!votingByBet[bet.id];
+              const voteVisual = voteVisualByBet[bet.id];
+              const baseRatio = bet.poolTotal > 0 ? bet.poolYes / bet.poolTotal : 0.5;
+              const ratio = Number.isFinite(voteVisual?.ratio) ? voteVisual.ratio : baseRatio;
+              const oddsYes = Math.round(baseRatio * 100);
+              const oddsNo = 100 - oddsYes;
+              const statusText = bet.aiVerdict === 'PASS' ? 'Success' : isOpen ? 'Active' : 'Expired';
+              const statusStyle =
+                bet.aiVerdict === 'PASS'
+                  ? styles.commitStatusSuccess
+                  : isOpen
+                    ? styles.commitStatusActive
+                    : styles.commitStatusExpired;
+              const timeText = isOpen ? formatTimeRemaining(bet.proofDeadlineAtMs, nowMs) : statusText;
+              const visibleBackers = predictions.slice(0, 2);
+              const backerProgress = Math.max(0.08, Math.min(1, visibleBackers.length / 2));
+
+              return (
+                <View key={`commit_${bet.id}`} style={[styles.commitCard, voteVisual?.flashNo && styles.mockCardFlashNo]}>
+                  <View style={styles.mockCardHeader}>
+                    <View style={styles.mockAvatar}>
+                      <Text style={styles.mockAvatarText}>{getInitials(bet.ownerName)}</Text>
+                    </View>
+                    <View style={styles.mockOwnerText}>
+                      <Text style={styles.commitOwnerName}>{bet.ownerName}</Text>
+                      <Text style={styles.mockOwnerHandle}>{toHandle(bet.ownerName)}</Text>
+                    </View>
+                    <View style={styles.commitTypePill}>
+                      <Text style={styles.commitTypePillText}>COMMITMENT</Text>
+                    </View>
+                  </View>
+
+                  <Text style={styles.commitTitle}>{cleanBetCardTitle(bet.text)}</Text>
+
+                  <View style={styles.commitMetaRow}>
+                    <View style={styles.mockSoftTag}>
+                      <Text style={styles.mockSoftTagText}>{getBetTag(bet.text)}</Text>
+                    </View>
+                    <View style={[styles.commitStatusPill, statusStyle]}>
+                      <Text style={styles.commitStatusText}>{statusText}</Text>
+                    </View>
+                    <Text style={styles.commitTimeText}>{timeText}</Text>
+                  </View>
+
+                  <View style={styles.commitPoolWrap}>
+                    <View style={styles.commitPoolTop}>
+                      <Text style={styles.commitPoolBackers}>{`${visibleBackers.length}/2 backers`}</Text>
+                      <Text style={styles.commitPoolTotal}>{`Coin ${bet.poolTotal || 0}`}</Text>
+                    </View>
+                    <View style={styles.commitPoolBar}>
+                      <View style={[styles.commitPoolBarFill, { width: `${(backerProgress * 100).toFixed(0)}%` }]} />
+                    </View>
+                    <View style={styles.commitBackersList}>
+                      {visibleBackers.map((prediction) => (
+                        <Text key={`${bet.id}_${prediction.id}_backer`} style={styles.commitBackerItem}>
+                          {prediction.userName} Coin {prediction.amount}
+                        </Text>
+                      ))}
+                    </View>
+                  </View>
+                  <View style={styles.voteLiquidTrack}>
+                    <Animated.View
+                      style={[
+                        styles.voteLiquidFill,
+                        { width: `${(ratio * 100).toFixed(0)}%` },
+                        voteVisual?.glowYes ? styles.voteLiquidFillYesGlow : styles.voteLiquidFillDefault,
+                        voteVisual?.flashNo && styles.voteLiquidFillNo,
+                      ]}
+                    />
+                  </View>
+                  <Text style={styles.voteOddsText}>{`Odds now: YES ${oddsYes}% | NO ${oddsNo}%`}</Text>
+
+                  {canVote && (
+                    <View style={styles.mockActionRow}>
+                      <Pressable
+                        style={[
+                          styles.mockVoteYesBtn,
+                          selectedSide === 'YES' && styles.mockVoteYesBtnActive,
+                          voteLoading && styles.mockVoteBtnDisabled,
+                        ]}
+                        onPress={() => submitVoteWithFeedback(bet.id, 'YES')}
+                        disabled={voteLoading}
+                      >
+                        <Text style={styles.mockVoteYesText}>
+                          {voteLoading && selectedSide === 'YES' ? 'Voting...' : selectedSide === 'YES' ? 'Selected' : 'Vote Yes'}
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        style={[
+                          styles.mockVoteNoBtn,
+                          selectedSide === 'NO' && styles.mockVoteNoBtnActive,
+                          voteLoading && styles.mockVoteBtnDisabled,
+                        ]}
+                        onPress={() => submitVoteWithFeedback(bet.id, 'NO')}
+                        disabled={voteLoading}
+                      >
+                        <Text style={styles.mockVoteNoText}>
+                          {voteLoading && selectedSide === 'NO' ? 'Voting...' : selectedSide === 'NO' ? 'Selected' : 'Vote No'}
+                        </Text>
+                      </Pressable>
+                    </View>
+                  )}
+
+                  {commitmentsView === 'My Commitments' && bet.ownerId === selfId && bet.status === 'OPEN' && (
+                    <View style={styles.proofWrap}>
+                      <TextInput
+                        value={proof[bet.id] || ''}
+                        onChangeText={(value) =>
+                          setProof((prev) => ({
+                            ...prev,
+                            [bet.id]: value,
+                          }))
+                        }
+                        placeholder="Proof note (optional)"
+                        placeholderTextColor="#7F73A3"
+                        style={styles.input}
+                      />
+                      {!!proofImageByBet[bet.id] && (
+                        <Image source={{ uri: proofImageByBet[bet.id] }} style={styles.proofImage} />
+                      )}
+                      <Pressable style={styles.dropzone} onPress={() => pickProofImage(bet.id)}>
+                        <Text style={styles.dropzoneText}>
+                          {proofImageByBet[bet.id] ? 'Photo Added' : 'Capture Proof Photo'}
+                        </Text>
+                      </Pressable>
+                      <Pressable style={styles.submitEvidenceBtn} onPress={() => submitEvidenceWithShutter(bet.id)}>
+                        <Text style={styles.primaryBtnText}>Submit Evidence</Text>
+                      </Pressable>
+                    </View>
+                  )}
+
+                  {bet.aiVerdict === 'PASS' && (
+                    <View style={styles.commitCompleteBanner}>
+                      <Text style={styles.commitCompleteText}>Commitment Completed!</Text>
+                    </View>
+                  )}
+                </View>
+              );
+            })}
+          </View>
+        )}
+
+        {tab === 'Leaderboard' && (
+          <View>
+            <Text style={styles.screenTitle}>Leaderboard</Text>
+            <View style={styles.screenSegment}>
+              {['The Committed', 'The Prophets'].map((mode) => {
+                const active = leaderboardMode === mode;
+                return (
+                  <Pressable
+                    key={mode}
+                    style={[styles.screenSegmentBtn, active && styles.screenSegmentBtnActive]}
+                    onPress={() => setLeaderboardMode(mode)}
+                  >
+                    <Text style={[styles.screenSegmentText, active && styles.screenSegmentTextActive]}>{mode}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <View style={styles.lbRangeRow}>
+              {['All Time', 'This Week', 'This Month'].map((item) => {
+                const active = leaderboardRange === item;
+                return (
+                  <Pressable
+                    key={item}
+                    style={[styles.lbRangeChip, active && styles.lbRangeChipActive]}
+                    onPress={() => setLeaderboardRange(item)}
+                  >
+                    <Text style={[styles.lbRangeText, active && styles.lbRangeTextActive]}>{item}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <View style={styles.sectionRule} />
+
+            {activeLeaderboardRows.slice(0, 5).map((row, index) => (
+              <View key={`lb_new_${row.userId}`} style={styles.lbCard}>
+                <View style={styles.lbLeftGroup}>
+                  <Text style={styles.lbMedal}>{index < 3 ? `${index + 1}` : `#${index + 1}`}</Text>
+                  <View style={styles.mockAvatar}>
+                    <Text style={styles.mockAvatarText}>{getInitials(row.name)}</Text>
+                  </View>
+                  <View style={styles.lbTextWrap}>
+                    <Text style={styles.lbName} numberOfLines={1}>{row.name}</Text>
+                    <Text style={styles.lbSub} numberOfLines={1}>{row.subLabel}</Text>
+                  </View>
+                </View>
+                <View style={styles.lbRightGroup}>
+                  <Text style={styles.lbScore}>{`${Math.round(row.score)}%`}</Text>
+                  <Text style={styles.lbMetric}>{row.metricLabel}</Text>
+                </View>
+              </View>
+            ))}
+
+            <Text style={styles.lbYourPosLabel}>YOUR POSITION</Text>
+            {selfLeaderboardRow ? (
+              <View style={styles.lbSelfCard}>
+                <View style={styles.lbLeftGroup}>
+                  <Text style={styles.lbSelfRank}>
+                    {`#${Math.max(
+                      1,
+                      activeLeaderboardRows.findIndex((row) => row.userId === selfId) + 1
+                    )}`}
+                  </Text>
+                  <View style={styles.mockAvatar}>
+                    <Text style={styles.mockAvatarText}>{getInitials(selfLeaderboardRow.name)}</Text>
+                  </View>
+                  <View style={styles.lbTextWrap}>
+                    <Text style={styles.lbName} numberOfLines={1}>{selfLeaderboardRow.name}</Text>
+                    <Text style={styles.lbSub} numberOfLines={1}>{selfLeaderboardRow.subLabel}</Text>
+                  </View>
+                </View>
+                <View style={styles.lbRightGroup}>
+                  <Text style={styles.lbScore}>{`${Math.round(selfLeaderboardRow.score)}%`}</Text>
+                  <Text style={styles.lbMetric}>{selfLeaderboardRow.metricLabel}</Text>
+                </View>
+              </View>
+            ) : (
+              <View style={styles.card}>
+                <Text style={styles.dimText}>No ranking data yet for your account.</Text>
+              </View>
+            )}
+            {activeLeaderboardRows.length === 0 && (
+              <View style={styles.card}>
+                <Text style={styles.dimText}>No leaderboard data yet.</Text>
+              </View>
+            )}
+          </View>
+        )}
+
+        {tab === 'Notifications' && (
+          <View>
+            <Text style={styles.screenTitle}>Notifications</Text>
+            <View style={styles.sectionRule} />
+            {notifications.length === 0 && (
+              <View style={styles.card}>
+                <Text style={styles.dimText}>No notifications yet.</Text>
+              </View>
+            )}
+            {notifications.map((item) => (
+              <View key={`notif_${item.id}`} style={styles.notificationCard}>
+                <Text style={styles.notificationTitle}>{item.title || 'Notification'}</Text>
+                <Text style={styles.notificationBody}>{item.body || 'No details.'}</Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {tab === 'Profile' && (
+          <View>
+            <View style={styles.profileHero}>
+              <View style={styles.profileTopRight}>
+                <Pressable style={styles.profileGearBtn} onPress={() => setShowSettingsSheet(true)}>
+                  <Text style={styles.profileGearIcon}>S</Text>
+                </Pressable>
+              </View>
+              <View style={styles.profileAvatarLarge}>
+                <Text style={styles.profileAvatarLargeText}>{getInitials(resolveActorName(authUser))}</Text>
+              </View>
+              <Text style={styles.profileName}>{resolveActorName(authUser)}</Text>
+              <Text style={styles.profileHandle}>{toHandle(resolveActorName(authUser))}</Text>
+
+              <View style={styles.profilePillRow}>
+                <View style={styles.profileMetricPill}>
+                  <Text style={styles.profileMetricPillText}>Coin {self?.coins || 0}</Text>
+                </View>
+                <View style={styles.profileMetricPill}>
+                  <Text style={styles.profileMetricPillText}>Fire {selfStreak}</Text>
+                </View>
+              </View>
+
+              <View style={styles.profileBadgeRow}>
+                {personalityTags.map((tag) => (
+                  <View key={`pt_${tag}`} style={styles.profileBadge}>
+                    <Text style={styles.profileBadgeText}>{tag}</Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+
+            <View style={styles.profileSectionTabs}>
+              {['Overview', 'Friends'].map((item) => {
+                const active = profileSection === item;
+                return (
+                  <Pressable
+                    key={item}
+                    style={[styles.profileSectionTabBtn, active && styles.profileSectionTabBtnActive]}
+                    onPress={() => setProfileSection(item)}
+                  >
+                    <Text style={[styles.profileSectionTabText, active && styles.profileSectionTabTextActive]}>{item}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            {profileSection === 'Overview' && (
+              <>
+                <View style={styles.profileStatsGrid}>
+                  <View style={styles.profileStatCard}>
+                    <Text style={styles.profileStatValue}>{selfStats?.totalBets || 0}</Text>
+                    <Text style={styles.profileStatLabel}>Made</Text>
+                  </View>
+                  <View style={styles.profileStatCard}>
+                    <Text style={styles.profileStatValue}>{selfStats?.passCount || 0}</Text>
+                    <Text style={styles.profileStatLabel}>Kept</Text>
+                  </View>
+                  <View style={styles.profileStatCard}>
+                    <Text style={styles.profileStatValue}>{`${profileRate}%`}</Text>
+                    <Text style={styles.profileStatLabel}>Rate</Text>
+                  </View>
+                  <View style={styles.profileStatCard}>
+                    <Text style={styles.profileStatValue}>{friends.length}</Text>
+                    <Text style={styles.profileStatLabel}>Friends</Text>
+                  </View>
+                </View>
+
+                <View style={styles.profileRoastCard}>
+                  <Text style={styles.profileRoastTitle}>Weekly Roast Report</Text>
+                  <Text style={styles.profileRoastBody}>{weeklyRoast}</Text>
+                  <Pressable
+                    style={styles.profileAiBtn}
+                    onPress={() => selfId && generateRecapForUser(selfId)}
+                    disabled={!selfId || !!selfRecapLoading}
+                  >
+                    <Text style={styles.profileAiBtnText}>
+                      {selfRecapLoading ? 'Generating AI Recap...' : 'Generate AI Recap'}
+                    </Text>
+                  </Pressable>
+                  {!!selfRecap && <Text style={styles.profileAiRecapText}>{selfRecap}</Text>}
+                </View>
+
+                <View style={styles.monetizeCard}>
+                  <Text style={styles.monetizeTitle}>Betme AI Access</Text>
+                  <Text style={styles.monetizeMeta}>{`Plan: ${selfMeta.plan === 'pro' ? 'Pro' : 'Free'} | AI Credits: ${selfMeta.aiCredits}`}</Text>
+                  <View style={styles.profileQuickRow}>
+                    <Pressable style={styles.smallBtnAlt} onPress={upgradeToPro}>
+                      <Text style={styles.smallBtnText}>Upgrade Pro</Text>
+                    </Pressable>
+                    <Pressable style={styles.smallBtn} onPress={buyAiCreditPack}>
+                      <Text style={styles.smallBtnText}>Buy 10 Credits</Text>
+                    </Pressable>
+                  </View>
+                  <Text style={styles.monetizeHint}>Freemium model: free users spend AI credits, Pro gets unlimited AI features.</Text>
+                </View>
+
+                <View style={styles.referralCard}>
+                  <Text style={styles.referralTitle}>Referral Loop</Text>
+                  <Text style={styles.referralMeta}>{`Your code: ${selfMeta.referralCode || 'N/A'} | Referrals: ${selfMeta.referralCount || 0}`}</Text>
+                  <TextInput
+                    value={referralInput}
+                    onChangeText={setReferralInput}
+                    placeholder="Enter referral code"
+                    placeholderTextColor="#7F73A3"
+                    autoCapitalize="characters"
+                    style={styles.input}
+                  />
+                  <View style={styles.profileQuickRow}>
+                    <Pressable style={styles.smallBtn} onPress={applyReferralCode}>
+                      <Text style={styles.smallBtnText}>Apply Code</Text>
+                    </Pressable>
+                    <Pressable style={styles.smallBtnAlt} onPress={shareProfileSnapshot}>
+                      <Text style={styles.smallBtnText}>Share Snapshot</Text>
+                    </Pressable>
+                  </View>
+                </View>
+
+                <View style={styles.profileQuickRow}>
+                  <Pressable style={styles.smallBtn} onPress={shareInvite}>
+                    <Text style={styles.smallBtnText}>Share Invite</Text>
+                  </Pressable>
+                  <Pressable style={styles.smallBtnAlt} onPress={() => setShowSettingsSheet(true)}>
+                    <Text style={styles.smallBtnText}>{`Friends ${incomingRequests.length}`}</Text>
+                  </Pressable>
+                </View>
+              </>
+            )}
+
+            {profileSection === 'Friends' && (
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Friends</Text>
+                <TextInput
+                  value={friendEmail}
+                  onChangeText={setFriendEmail}
+                  placeholder="Friend email"
+                  placeholderTextColor="#7F73A3"
+                  autoCapitalize="none"
+                  keyboardType="email-address"
+                  style={styles.input}
+                />
+                <Pressable style={styles.primaryBtn} onPress={sendFriendRequest}>
+                  <Text style={styles.primaryBtnText}>Send Request</Text>
+                </Pressable>
+                {friends.length === 0 && <Text style={styles.dimText}>No friends yet.</Text>}
+                {friends.map((friend) => (
+                  <Text key={`profile_friend_${friend.id}`} style={styles.betLine}>
+                    {friend.name || friend.email || friend.id}
+                  </Text>
+                ))}
+                <Text style={styles.cardTitle}>Incoming Requests</Text>
+                {incomingRequests.length === 0 && <Text style={styles.dimText}>No incoming requests.</Text>}
+                {incomingRequests.map((req) => (
+                  <View key={`profile_req_${req.id}`} style={styles.requestRow}>
+                    <Text style={styles.walletName}>{req.fromName || req.fromEmail || req.id}</Text>
+                    <View style={styles.rowGap}>
+                      <Pressable style={styles.smallBtn} onPress={() => acceptFriendRequest(req)}>
+                        <Text style={styles.smallBtnText}>Accept</Text>
+                      </Pressable>
+                      <Pressable style={styles.smallBtnAlt} onPress={() => rejectFriendRequest(req)}>
+                        <Text style={styles.smallBtnText}>Reject</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
+        )}
+
+          {!!message && (
+            <View style={styles.toast}>
+              <Text style={styles.toastText}>{message}</Text>
+            </View>
+          )}
+        </ScrollView>
+        <Modal visible={showCreateBetModal} transparent animationType="slide" onRequestClose={() => setShowCreateBetModal(false)}>
+          <View style={styles.sheetBackdrop}>
+            <Pressable style={styles.sheetBackdropTap} onPress={() => setShowCreateBetModal(false)} />
+            <View style={styles.sheetPanel}>
+              <Text style={styles.cardTitle}>Create Bet</Text>
+              <View style={styles.betTypeTabs}>
+                {[
+                  { key: 'CALL_OUT', label: 'Call Out' },
+                  { key: 'COMMITMENT', label: 'Commitment' },
+                ].map((item) => {
+                  const active = betKind === item.key;
+                  return (
+                    <Pressable
+                      key={item.key}
+                      style={[styles.betTypeTabBtn, active && styles.betTypeTabBtnActive]}
+                      onPress={() => setBetKind(item.key)}
+                    >
+                      <Text style={[styles.betTypeTabText, active && styles.betTypeTabTextActive]}>{item.label}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
               <TextInput
                 value={betText}
                 onChangeText={setBetText}
-                placeholder="I will wake up at 5 AM tomorrow"
-                placeholderTextColor="#62B862"
+                placeholder="I will run 5km before 7am"
+                placeholderTextColor="#7F73A3"
                 style={styles.input}
               />
               <TextInput
                 value={stakeAmount}
                 onChangeText={setStakeAmount}
                 placeholder="Stake coins on yourself (optional)"
-                placeholderTextColor="#62B862"
+                placeholderTextColor="#7F73A3"
                 keyboardType="number-pad"
                 style={styles.input}
               />
@@ -1412,370 +2671,72 @@ export default function App() {
                   onChange={onDeadlineChange}
                 />
               )}
-              <View style={styles.tagRow}>
-                <Pressable style={styles.tagPill} onPress={() => setBetText('I will wake up at 5 AM tomorrow')}>
-                  <Text style={styles.tagPillText}>Wake Up</Text>
+              <View style={styles.createModalActions}>
+                <Pressable style={styles.smallBtn} onPress={runAiDraftBet} disabled={aiDraftLoading}>
+                  <Text style={styles.smallBtnText}>{aiDraftLoading ? 'AI Drafting...' : 'AI Draft'}</Text>
                 </Pressable>
-                <Pressable style={styles.tagPill} onPress={() => setBetText('I will finish my workout before 7 PM')}>
-                  <Text style={styles.tagPillText}>Fitness</Text>
-                </Pressable>
-                <Pressable style={styles.tagPill} onPress={() => setBetText('I will complete 2 hours of focused study')}>
-                  <Text style={styles.tagPillText}>Learning</Text>
+                <Pressable style={styles.smallBtnAlt} onPress={runAiBetPreview} disabled={aiPreviewLoading}>
+                  <Text style={styles.smallBtnText}>{aiPreviewLoading ? 'Previewing...' : 'AI Preview'}</Text>
                 </Pressable>
               </View>
-              <Pressable style={styles.postFabWide} onPress={createNewBet}>
+              {!!aiPreview && (
+                <View style={styles.aiPreviewCard}>
+                  <Text style={styles.aiPreviewTitle}>{`AI Odds ${aiPreview.odds}%`}</Text>
+                  <Text style={styles.aiPreviewMeta}>{`Risk ${aiPreview.riskLabel}`}</Text>
+                  <Text style={styles.aiPreviewText}>{aiPreview.bookie}</Text>
+                </View>
+              )}
+              <Pressable
+                style={styles.primaryBtn}
+                onPress={async () => {
+                  const ok = await createNewBet();
+                  if (ok) setShowCreateBetModal(false);
+                }}
+              >
                 <Text style={styles.primaryBtnText}>Post Bet</Text>
               </Pressable>
             </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Friends Feed</Text>
-              <TextInput
-                value={betAmount}
-                onChangeText={setBetAmount}
-                keyboardType="number-pad"
-                placeholder="Prediction amount"
-                placeholderTextColor="#62B862"
-                style={styles.input}
-              />
-
-              {friendFeedBets.length === 0 && (
-                <View>
-                  <Text style={styles.dimText}>No friend bets yet.</Text>
-                  <Text style={styles.dimText}>Send or accept friend requests in Social tab.</Text>
-                  <Pressable style={styles.smallBtn} onPress={() => setTab('Social')}>
-                    <Text style={styles.smallBtnText}>Go To Social</Text>
-                  </Pressable>
-                </View>
-              )}
-
-              {friendFeedBets.map((bet) => {
-                const predictions = predictionsByBet[bet.id] || [];
-                const disputes = disputesByBet[bet.id] || [];
-                const comments = commentsByBet[bet.id] || [];
-                const reactions = reactionsByBet[bet.id] || [];
-                const myPrediction = predictions.find((p) => p.userId === selfId);
-                const myDispute = disputes.find((d) => d.userId === selfId);
-                const ownerStats = ownerStatsByUser[bet.ownerId] || computeUserHistoryStats(bets, bet.ownerId);
-                const ownerOdds = Number.isFinite(bet.ownerFollowThroughOdds)
-                  ? bet.ownerFollowThroughOdds
-                  : predictPassOddsFromHistory(ownerStats);
-                const trueOdds = Number.isFinite(bet.trueOdds) ? bet.trueOdds : ownerOdds;
-                const disputeOpen =
-                  bet.disputeWindowEndsAtMs > 0 && Date.now() <= bet.disputeWindowEndsAtMs;
-                const proofDeadlinePassed =
-                  bet.proofDeadlineAtMs > 0 && Date.now() > bet.proofDeadlineAtMs;
-                return (
-                  <View key={bet.id} style={styles.betCard}>
-                    <View style={styles.betHeaderRow}>
-                      <View style={styles.ownerBadge}>
-                        <Text style={styles.ownerBadgeText}>{getInitials(bet.ownerName)}</Text>
-                      </View>
-                      <View style={styles.ownerHeaderMeta}>
-                        <Text style={styles.meta}>@{bet.ownerName}</Text>
-                        <View style={styles.tagPill}>
-                          <Text style={styles.tagPillText}>{getBetTag(bet.text)}</Text>
-                        </View>
-                      </View>
-                    </View>
-
-                    <Text style={styles.betTitle}>{bet.text}</Text>
-                    <Text style={styles.meta}>Deadline: {bet.deadlineISO}</Text>
-                    {!!bet.riskLabel && <Text style={styles.meta}>Risk: {bet.riskLabel}</Text>}
-                    {Number.isFinite(bet.ownerStake) && bet.ownerStake > 0 && (
-                      <Text style={styles.meta}>
-                        Owner stake: {bet.ownerStake} coins x{bet.ownerStakeMultiplier || 1.8}
-                      </Text>
-                    )}
-                    {!!bet.aiBookieComment && (
-                      <View style={styles.aiBookieBubble}>
-                        <Text style={styles.aiBookieLabel}>AI BOOKIE</Text>
-                        <Text style={styles.aiTerminalText}>{bet.aiBookieComment}</Text>
-                      </View>
-                    )}
-
-                    <View style={styles.meterSection}>
-                      <Text style={styles.meterLabel}>Pool Ratio</Text>
-                      <View style={styles.poolTrack}>
-                        <View
-                          style={[
-                            styles.poolYesFill,
-                            {
-                              width: `${Math.max(
-                                4,
-                                ((bet.poolTotal ? bet.poolYes / bet.poolTotal : 0.5) * 100).toFixed(0)
-                              )}%`,
-                            },
-                          ]}
-                        />
-                      </View>
-                      <View style={styles.poolLabels}>
-                        <Text style={styles.poolYesText}>YES {bet.poolYes}</Text>
-                        <Text style={styles.poolNoText}>NO {bet.poolNo}</Text>
-                      </View>
-                    </View>
-
-                    <View style={styles.meterSection}>
-                      <Text style={styles.meterLabel}>Confidence Meter</Text>
-                      <View style={styles.confidenceTrack}>
-                        <View
-                          style={[
-                            styles.confidenceFill,
-                            { width: `${Math.max(4, Math.min(100, trueOdds)).toFixed(0)}%` },
-                          ]}
-                        />
-                      </View>
-                      <Text style={styles.meta}>
-                        {trueOdds.toFixed(0)}% true odds from {ownerStats.resolvedCount} resolved bets
-                      </Text>
-                    </View>
-
-                    <View style={styles.facepileRow}>
-                      <Text style={styles.meta}>Predictors</Text>
-                      <View style={styles.facepileWrap}>
-                        {predictions.slice(0, 5).map((prediction, index) => (
-                          <View
-                            key={`${bet.id}_${prediction.id}_fp`}
-                            style={[styles.facepileItem, { marginLeft: index === 0 ? 0 : -10 }]}
-                          >
-                            <Text style={styles.facepileText}>{getInitials(prediction.userName)}</Text>
-                          </View>
-                        ))}
-                        {predictions.length > 5 && (
-                          <View style={[styles.facepileItem, { marginLeft: -10 }]}>
-                            <Text style={styles.facepileText}>+{predictions.length - 5}</Text>
-                          </View>
-                        )}
-                      </View>
-                    </View>
-
-                    <View style={styles.aiTerminal}>
-                      <Text style={styles.aiTerminalTitle}>AI VERDICT SCAN</Text>
-                      <Text
-                        style={[
-                          styles.verdictBadge,
-                          bet.aiVerdict === 'PASS' && styles.verdictPass,
-                          bet.aiVerdict === 'FAIL' && styles.verdictFail,
-                        ]}
-                      >
-                        {bet.aiVerdict}
-                      </Text>
-                      {!!bet.aiReason && <Text style={styles.aiTerminalText}>{bet.aiReason}</Text>}
-                    </View>
-                    {!!bet.proofImageUri && (
-                      <Image source={{ uri: bet.proofImageUri }} style={styles.proofImage} />
-                    )}
-                    {!!bet.victoryPosterUri && (
-                      <View style={styles.posterWrap}>
-                        <Text style={styles.meta}>Victory poster ({bet.victoryPosterStyle || 'enhanced'}):</Text>
-                        <Image source={{ uri: bet.victoryPosterUri }} style={styles.posterImage} />
-                        <Pressable style={styles.smallBtn} onPress={() => shareVictoryPoster(bet)}>
-                          <Text style={styles.smallBtnText}>Share Victory Poster</Text>
-                        </Pressable>
-                      </View>
-                    )}
-                    {!!bet.victoryPosterError && <Text style={styles.dimText}>{bet.victoryPosterError}</Text>}
-
-                    {bet.status === 'OPEN' && !myPrediction && !proofDeadlinePassed && bet.ownerId !== selfId && (
-                      <View style={styles.rowGap}>
-                        <Pressable style={styles.yesPillBtn} onPress={() => handlePredictionTap(bet.id, 'YES')}>
-                          <Text style={styles.smallBtnText}>YES</Text>
-                        </Pressable>
-                        <Pressable style={styles.noPillBtn} onPress={() => handlePredictionTap(bet.id, 'NO')}>
-                          <Text style={styles.smallBtnText}>NO</Text>
-                        </Pressable>
-                      </View>
-                    )}
-                    {!!coinBurstByBet[bet.id] && (
-                      <View style={styles.coinBurstRow}>
-                        <Text style={styles.coinBurst}>🪙</Text>
-                        <Text style={styles.coinBurst}>✨</Text>
-                        <Text style={styles.coinBurst}>🪙</Text>
-                      </View>
-                    )}
-
-                    {proofDeadlinePassed && bet.status === 'OPEN' && (
-                      <Text style={styles.fail}>Proof deadline passed. This bet is awaiting expiry.</Text>
-                    )}
-
-                    {!!myPrediction && (
-                      <Text style={styles.meta}>
-                        Your prediction: {myPrediction.side} ({myPrediction.amount})
-                      </Text>
-                    )}
-
-                    {bet.status === 'SETTLED' && myPrediction && disputeOpen && !myDispute && (
-                      <Pressable style={styles.smallBtnAlt} onPress={() => raiseDispute(bet.id)}>
-                        <Text style={styles.smallBtnText}>Raise Dispute</Text>
-                      </Pressable>
-                    )}
-
-                    {bet.status === 'OPEN' && bet.ownerId === selfId && (
-                      <View style={styles.proofWrap}>
-                        <TextInput
-                          value={proof[bet.id] || ''}
-                          onChangeText={(value) =>
-                            setProof((prev) => ({
-                              ...prev,
-                              [bet.id]: value,
-                            }))
-                          }
-                          placeholder="Proof note (required with photo)"
-                          placeholderTextColor="#62B862"
-                          style={styles.input}
-                        />
-                        {!!proofImageByBet[bet.id] && (
-                          <Image source={{ uri: proofImageByBet[bet.id] }} style={styles.proofImage} />
-                        )}
-                        <Pressable style={[styles.primaryBtn, styles.attachBtn]} onPress={() => pickProofImage(bet.id)}>
-                          <Text style={styles.primaryBtnText}>Upload Proof Photo</Text>
-                        </Pressable>
-                        <Text style={styles.meta}>
-                          Photo selected: {proofImageByBet[bet.id] ? 'Yes' : 'No'}
-                        </Text>
-                        <Pressable style={[styles.primaryBtn, styles.attachBtn]} onPress={() => pickProofVideo(bet.id)}>
-                          <Text style={styles.primaryBtnText}>Upload 3s Liveness Video</Text>
-                        </Pressable>
-                        <Text style={styles.meta}>Video selected: {proofVideoByBet[bet.id] ? 'Yes' : 'No'}</Text>
-                        {!!bet.secretGesture && (
-                          <Text style={styles.meta}>Liveness challenge: {bet.secretGesture}</Text>
-                        )}
-                        <Pressable style={styles.primaryBtn} onPress={() => submitProof(bet.id)}>
-                          <Text style={styles.primaryBtnText}>Submit Proof for AI</Text>
-                        </Pressable>
-                      </View>
-                    )}
-
-                    {bet.status === 'OPEN' && bet.ownerId !== selfId && (
-                      <Text style={styles.dimText}>Only the bet owner can upload proof.</Text>
-                    )}
-
-                    {bet.status === 'SETTLED' && bet.ownerId === selfId && disputes.length > 0 && (
-                      <Pressable style={styles.smallBtn} onPress={() => startManualReview(bet.id)}>
-                        <Text style={styles.smallBtnText}>Start Manual Review</Text>
-                      </Pressable>
-                    )}
-
-                    {bet.status === 'UNDER_REVIEW' && bet.ownerId === selfId && (
-                      <View style={styles.rowGap}>
-                        <Pressable style={styles.smallBtn} onPress={() => resolveManualReview(bet.id, 'PASS')}>
-                          <Text style={styles.smallBtnText}>Manual PASS</Text>
-                        </Pressable>
-                        <Pressable style={styles.smallBtnAlt} onPress={() => resolveManualReview(bet.id, 'FAIL')}>
-                          <Text style={styles.smallBtnText}>Manual FAIL</Text>
-                        </Pressable>
-                      </View>
-                    )}
-
-                    <Text style={styles.meta}>Predictions:</Text>
-                    {predictions.map((prediction) => (
-                      <Text key={`${bet.id}_${prediction.id}`} style={styles.betLine}>
-                        {prediction.userName} -> {prediction.side} ({prediction.amount})
-                      </Text>
-                    ))}
-                    {predictions.length === 0 && <Text style={styles.dimText}>No predictions yet.</Text>}
-
-                    <Text style={styles.meta}>Disputes:</Text>
-                    {disputes.map((dispute) => (
-                      <Text key={`${bet.id}_d_${dispute.id}`} style={styles.betLine}>
-                        {dispute.userName} -> {dispute.reason}
-                      </Text>
-                    ))}
-                    {disputes.length === 0 && <Text style={styles.dimText}>No disputes.</Text>}
-                    {!!bet.aiDisputeSummary && (
-                      <View style={styles.aiTerminal}>
-                        <Text style={styles.aiTerminalTitle}>AI DISPUTE SUMMARY ({bet.aiDisputeProvider || 'fallback'})</Text>
-                        <Text style={styles.aiTerminalText}>{bet.aiDisputeSummary}</Text>
-                      </View>
-                    )}
-
-                    <Text style={styles.meta}>Reactions:</Text>
-                    <View style={styles.rowGap}>
-                      <Pressable style={styles.smallBtn} onPress={() => setReaction(bet.id, '🔥')}>
-                        <Text style={styles.smallBtnText}>🔥</Text>
-                      </Pressable>
-                      <Pressable style={styles.smallBtn} onPress={() => setReaction(bet.id, '👏')}>
-                        <Text style={styles.smallBtnText}>👏</Text>
-                      </Pressable>
-                      <Pressable style={styles.smallBtn} onPress={() => setReaction(bet.id, '💯')}>
-                        <Text style={styles.smallBtnText}>💯</Text>
-                      </Pressable>
-                    </View>
-                    {reactions.length > 0 && (
-                      <Text style={styles.meta}>
-                        {reactions.map((r) => r.emoji).join(' ')} ({reactions.length})
-                      </Text>
-                    )}
-
-                    <Text style={styles.meta}>Comments:</Text>
-                    <TextInput
-                      value={commentDraftByBet[bet.id] || ''}
-                      onChangeText={(value) =>
-                        setCommentDraftByBet((prev) => ({
-                          ...prev,
-                          [bet.id]: value,
-                        }))
-                      }
-                      placeholder="Add a comment..."
-                      placeholderTextColor="#62B862"
-                      style={styles.input}
-                    />
-                    <Pressable style={styles.smallBtn} onPress={() => addComment(bet.id)}>
-                      <Text style={styles.smallBtnText}>Post Comment</Text>
-                    </Pressable>
-                    {comments.map((comment) => (
-                      <Text key={`${bet.id}_c_${comment.id}`} style={styles.betLine}>
-                        {comment.userName}: {comment.text}
-                      </Text>
-                    ))}
-                    {comments.length === 0 && <Text style={styles.dimText}>No comments yet.</Text>}
-                  </View>
-                );
-              })}
+          </View>
+        </Modal>
+        <Modal visible={showSettingsSheet} transparent animationType="slide" onRequestClose={() => setShowSettingsSheet(false)}>
+          <View style={styles.sheetBackdrop}>
+            <Pressable style={styles.sheetBackdropTap} onPress={() => setShowSettingsSheet(false)} />
+            <View style={styles.sheetPanel}>
+              <Text style={styles.cardTitle}>Settings</Text>
+              <View style={styles.settingsRow}>
+                <Text style={styles.meta}>Streak label</Text>
+                <Text style={styles.walletName}>Fire {selfStreak}</Text>
+              </View>
+              <View style={styles.settingsRow}>
+                <Text style={styles.meta}>Plan</Text>
+                <Text style={styles.walletName}>{selfMeta.plan === 'pro' ? 'Pro' : 'Free'}</Text>
+              </View>
+              <View style={styles.settingsRow}>
+                <Text style={styles.meta}>AI Credits</Text>
+                <Text style={styles.walletName}>{selfMeta.aiCredits}</Text>
+              </View>
+              <Pressable style={styles.smallBtnAlt} onPress={handleLogout}>
+                <Text style={styles.smallBtnText}>Logout</Text>
+              </Pressable>
+              <Pressable style={styles.primaryBtn} onPress={() => setShowSettingsSheet(false)}>
+                <Text style={styles.primaryBtnText}>Done</Text>
+              </Pressable>
             </View>
           </View>
-        )}
-
-        {tab === 'My Bets' && (
-          <View>
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>My Bets</Text>
-              {myBets.length === 0 && <Text style={styles.dimText}>You have not posted any bets yet.</Text>}
-              {myBets.map((bet) => {
-                const stats = ownerStatsByUser[bet.ownerId] || computeUserHistoryStats(bets, bet.ownerId);
-                const odds = Number.isFinite(bet.ownerFollowThroughOdds)
-                  ? bet.ownerFollowThroughOdds
-                  : predictPassOddsFromHistory(stats);
-                return (
-                  <View key={`mine_${bet.id}`} style={styles.promiseCard}>
-                    <Text style={styles.promiseText}>{bet.text}</Text>
-                    <Text style={styles.meta}>Status: {bet.status}</Text>
-                    <Text style={styles.meta}>Odds snapshot: {odds.toFixed(0)}%</Text>
-                    <Text style={styles.meta}>Deadline: {bet.deadlineISO}</Text>
-                    <Text style={styles.meta}>Pool: {bet.poolTotal} coins</Text>
-                  </View>
-                );
-              })}
-            </View>
-          </View>
-        )}
-
-        {tab === 'Social' && (
-          <View>
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Invite</Text>
+        </Modal>
+        <Modal visible={showSocialSheet} transparent animationType="slide" onRequestClose={() => setShowSocialSheet(false)}>
+          <View style={styles.sheetBackdrop}>
+            <Pressable style={styles.sheetBackdropTap} onPress={() => setShowSocialSheet(false)} />
+            <View style={styles.sheetPanel}>
+              <Text style={styles.cardTitle}>Social Center</Text>
               <Pressable style={styles.primaryBtn} onPress={shareInvite}>
                 <Text style={styles.primaryBtnText}>Share Invite Link</Text>
               </Pressable>
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Add Friend</Text>
               <TextInput
                 value={friendEmail}
                 onChangeText={setFriendEmail}
                 placeholder="Friend email"
-                placeholderTextColor="#62B862"
+                placeholderTextColor="#7F73A3"
                 autoCapitalize="none"
                 keyboardType="email-address"
                 style={styles.input}
@@ -1783,13 +2744,10 @@ export default function App() {
               <Pressable style={styles.primaryBtn} onPress={sendFriendRequest}>
                 <Text style={styles.primaryBtnText}>Send Request</Text>
               </Pressable>
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Incoming Requests</Text>
+              <Text style={styles.meta}>Incoming Requests</Text>
               {incomingRequests.length === 0 && <Text style={styles.dimText}>No incoming requests.</Text>}
-              {incomingRequests.map((req) => (
-                <View key={`req_${req.id}`} style={styles.requestRow}>
+              {incomingRequests.slice(0, 4).map((req) => (
+                <View key={`modal_req_${req.id}`} style={styles.requestRow}>
                   <Text style={styles.walletName}>{req.fromName || req.fromEmail || req.id}</Text>
                   <View style={styles.rowGap}>
                     <Pressable style={styles.smallBtn} onPress={() => acceptFriendRequest(req)}>
@@ -1801,147 +2759,61 @@ export default function App() {
                   </View>
                 </View>
               ))}
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Friends</Text>
-              {friends.length === 0 && <Text style={styles.dimText}>No friends yet.</Text>}
-              {friends.map((friend) => (
-                <Text key={`f_${friend.id}`} style={styles.betLine}>
-                  {friend.name || friend.email || friend.id}
-                </Text>
-              ))}
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>AI Recaps</Text>
-              {knownUserIds.length === 0 && <Text style={styles.dimText}>No users to recap yet.</Text>}
-              {knownUserIds.map((userId) => {
-                const name = getDisplayNameForUser(userId);
-                const stats = ownerStatsByUser[userId] || computeUserHistoryStats(bets, userId);
-                const odds = predictPassOddsFromHistory(stats);
-                return (
-                  <View key={`recap_${userId}`} style={styles.myBetRow}>
-                    <Text style={styles.walletName}>{name}</Text>
-                    <Text style={styles.meta}>
-                      Odds: {odds.toFixed(0)}% | PASS {stats.passCount} / FAIL {stats.failCount}
-                    </Text>
-                    <Pressable
-                      style={styles.smallBtn}
-                      onPress={() => generateRecapForUser(userId)}
-                      disabled={!!recapLoadingByUser[userId]}
-                    >
-                      <Text style={styles.smallBtnText}>
-                        {recapLoadingByUser[userId] ? 'Generating...' : 'Generate AI Recap'}
-                      </Text>
-                    </Pressable>
-                    {!!recapByUser[userId] && (
-                      <Text style={styles.meta}>
-                        {recapByUser[userId]} ({recapProviderByUser[userId] || 'fallback'})
-                      </Text>
-                    )}
-                  </View>
-                );
-              })}
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Notifications</Text>
-              {notifications.length === 0 && <Text style={styles.dimText}>No notifications yet.</Text>}
-              {notifications.slice(0, 20).map((n) => (
-                <View key={`n_${n.id}`} style={styles.myBetRow}>
+              <Text style={styles.meta}>Notifications</Text>
+              {notifications.slice(0, 6).map((n) => (
+                <View key={`modal_n_${n.id}`} style={styles.myBetRow}>
                   <Text style={styles.walletName}>{n.title || 'Notification'}</Text>
                   <Text style={styles.meta}>{n.body || ''}</Text>
                 </View>
               ))}
             </View>
           </View>
-        )}
-
-        {tab === 'Profiles' && (
-          <View>
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>User Profiles</Text>
-              {knownUserIds.length === 0 && <Text style={styles.dimText}>No users available yet.</Text>}
-              {knownUserIds.map((userId) => {
-                const name = getDisplayNameForUser(userId);
-                const stats = ownerStatsByUser[userId] || computeUserHistoryStats(bets, userId);
-                const odds = predictPassOddsFromHistory(stats);
-                const streak = computeStreak(bets, userId);
-                const recentBets = bets
-                  .filter((b) => b.ownerId === userId)
-                  .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
-                  .slice(0, 5);
-                return (
-                  <View key={`profile_${userId}`} style={styles.promiseCard}>
-                    <Text style={styles.promiseText}>{name}</Text>
-                    <Text style={styles.meta}>Current streak: {streak}</Text>
-                    <Text style={styles.meta}>Total bets: {stats.totalBets}</Text>
-                    <Text style={styles.meta}>PASS: {stats.passCount} | FAIL: {stats.failCount}</Text>
-                    <Text style={styles.meta}>Expired: {stats.expiredCount}</Text>
-                    <Text style={styles.meta}>Follow-through odds: {odds.toFixed(0)}%</Text>
-                    {streak >= 7 && (
-                      <View style={styles.soulboundBadge}>
-                        <Text style={styles.soulboundTitle}>Soulbound Badge</Text>
-                        <Text style={styles.soulboundText}>7-day streak unlocked: Consistency Phantom</Text>
-                      </View>
-                    )}
-                    <Text style={styles.meta}>
-                      {userId === selfId ? 'My Bets:' : 'Recent Bets:'}
-                    </Text>
-                    {recentBets.length === 0 && <Text style={styles.dimText}>No bets yet.</Text>}
-                    {recentBets.map((bet) => (
-                      <Text key={`profile_bet_${userId}_${bet.id}`} style={styles.betLine}>
-                        {bet.text} ({bet.status})
-                      </Text>
-                    ))}
-                  </View>
-                );
-              })}
+        </Modal>
+        <Modal
+          visible={!!profileOverlayData}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setProfileOverlayUserId('')}
+        >
+          <View style={styles.sheetBackdrop}>
+            <Pressable style={styles.sheetBackdropTap} onPress={() => setProfileOverlayUserId('')} />
+            <View style={styles.sheetPanel}>
+              <Text style={styles.cardTitle}>{profileOverlayData?.name || 'Profile'}</Text>
+              <Text style={styles.meta}>Success Rate: {profileOverlayData?.successRate || 0}%</Text>
+              <Text style={styles.meta}>Total Wins: {profileOverlayData?.totalWins || 0}</Text>
+              <Text style={styles.meta}>Recent Proofs</Text>
+              <View style={styles.overlayProofGrid}>
+                {(profileOverlayData?.recentProofs || []).map((item) => (
+                  <Image
+                    key={`overlay_proof_${item.id}`}
+                    source={{ uri: item.victoryPosterUri || item.proofImageUri }}
+                    style={styles.overlayProofThumb}
+                  />
+                ))}
+                {(profileOverlayData?.recentProofs || []).length === 0 && (
+                  <Text style={styles.dimText}>No recent proofs.</Text>
+                )}
+              </View>
             </View>
           </View>
-        )}
-
-        {tab === 'Wallet' && (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Coin Wallet</Text>
-            {users.map((u) => (
-              <View key={u.id} style={styles.walletRow}>
-                <Text style={styles.walletName}>
-                  {u.name}
-                  {u.isSelf ? ' (You)' : ''}
-                </Text>
-                <Text style={styles.walletCoins}>{u.coins} coins</Text>
-              </View>
-            ))}
-            <Text style={styles.dimText}>Payout for other users should move to backend settlement.</Text>
-          </View>
-        )}
-
-        {tab === 'Rewards' && (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Redeem Rewards</Text>
-            <Text style={styles.meta}>Your balance: {self?.coins || 0} coins</Text>
-            {rewardCatalog.map((reward) => (
-              <View key={reward.id} style={styles.rewardRow}>
-                <View>
-                  <Text style={styles.rewardLabel}>{reward.label}</Text>
-                  <Text style={styles.meta}>{reward.cost} coins</Text>
-                </View>
-                <Pressable style={styles.smallBtn} onPress={() => redeemReward(reward)}>
-                  <Text style={styles.smallBtnText}>Redeem</Text>
-                </Pressable>
-              </View>
-            ))}
-          </View>
-        )}
-
-          {!!message && (
-            <View style={styles.toast}>
-              <Text style={styles.toastText}>{message}</Text>
-            </View>
-          )}
-        </ScrollView>
+        </Modal>
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.shutterOverlay,
+            {
+              opacity: shutterAnim,
+              transform: [
+                {
+                  scale: shutterAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [1.08, 1],
+                  }),
+                },
+              ],
+            },
+          ]}
+        />
         <View style={styles.bottomNavDock}>
           <TopNav current={tab} onChange={setTab} />
         </View>
@@ -1953,7 +2825,7 @@ export default function App() {
 const styles = StyleSheet.create({
   safe: {
     flex: 1,
-    backgroundColor: '#0A0A0A',
+    backgroundColor: '#050505',
   },
   appShell: {
     flex: 1,
@@ -1967,6 +2839,902 @@ const styles = StyleSheet.create({
   container: {
     padding: 16,
     paddingBottom: 110,
+  },
+  homeTopRow: {
+    marginBottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  brandTitle: {
+    color: '#A447FF',
+    fontSize: 26,
+    fontWeight: '800',
+    letterSpacing: 0.2,
+  },
+  homeTopStats: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  headerChip: {
+    borderRadius: 999,
+    backgroundColor: '#2A2342',
+    borderWidth: 1,
+    borderColor: 'rgba(179, 118, 255, 0.35)',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  headerChipText: {
+    color: '#F5B942',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  homeTabs: {
+    backgroundColor: '#26213B',
+    borderRadius: 14,
+    padding: 4,
+    flexDirection: 'row',
+    gap: 4,
+    marginBottom: 14,
+  },
+  homeActionRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 10,
+  },
+  coinChipWrap: {
+    position: 'relative',
+    overflow: 'visible',
+  },
+  coinBurstText: {
+    position: 'absolute',
+    right: 6,
+    top: -6,
+    color: '#FFE27A',
+    fontSize: 12,
+    fontWeight: '800',
+    textShadowColor: 'rgba(255, 226, 122, 0.65)',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 6,
+  },
+  coreLoopCard: {
+    backgroundColor: '#1C1730',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(126,72,219,0.26)',
+    padding: 10,
+    marginBottom: 10,
+  },
+  coreLoopTitle: {
+    color: '#EDE8FF',
+    fontSize: 13,
+    fontWeight: '800',
+    marginBottom: 6,
+  },
+  coreLoopText: {
+    color: '#B8B1D1',
+    fontSize: 12,
+    marginBottom: 3,
+  },
+  createBetBtn: {
+    flex: 1,
+    borderRadius: 10,
+    backgroundColor: '#8F4EF2',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 10,
+  },
+  createBetBtnText: {
+    color: '#F2EFFF',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  homeAmountInput: {
+    minWidth: 110,
+    backgroundColor: '#1C1730',
+    borderWidth: 1,
+    borderColor: 'rgba(126,72,219,0.4)',
+    color: '#EFEAFF',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 12,
+  },
+  homeTabBtn: {
+    flex: 1,
+    borderRadius: 10,
+    paddingVertical: 9,
+    alignItems: 'center',
+  },
+  homeTabBtnActive: {
+    backgroundColor: '#A13BDA',
+  },
+  homeTabText: {
+    color: '#7F7A8F',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  homeTabTextActive: {
+    color: '#F4E9FF',
+  },
+  mockFeedWrap: {
+    gap: 12,
+  },
+  mockCard: {
+    backgroundColor: '#1C1730',
+    borderColor: 'rgba(141, 75, 255, 0.26)',
+    borderWidth: 1,
+    borderRadius: 18,
+    padding: 14,
+    shadowColor: '#6C2DD6',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.24,
+    shadowRadius: 14,
+    elevation: 6,
+  },
+  mockCardFlashNo: {
+    borderColor: '#8D4DFF',
+    shadowColor: '#8D4DFF',
+    shadowOpacity: 0.45,
+  },
+  mockCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  mockAvatar: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: '#7D3BE4',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 8,
+  },
+  mockAvatarText: {
+    color: '#EBDDFF',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  mockOwnerText: {
+    flex: 1,
+  },
+  mockOwnerName: {
+    color: '#F2F0F9',
+    fontWeight: '700',
+    fontSize: 16,
+  },
+  mockOwnerHandle: {
+    color: '#88839B',
+    fontSize: 13,
+    marginTop: 1,
+  },
+  mockTypePill: {
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: '#AA4AF3',
+  },
+  mockTypePillText: {
+    color: '#F5E9FF',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+  },
+  mockBetTitle: {
+    color: '#F4F0FF',
+    fontSize: 20,
+    lineHeight: 28,
+    fontWeight: '700',
+    marginBottom: 12,
+  },
+  mockTagsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 12,
+  },
+  mockSoftTag: {
+    borderRadius: 999,
+    backgroundColor: '#2C2640',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  mockSoftTagText: {
+    color: '#B6AFCA',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  mockStatusTag: {
+    backgroundColor: '#1B4B3A',
+  },
+  mockStatusTagText: {
+    color: '#40E281',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  mockTimeWrap: {
+    marginLeft: 'auto',
+  },
+  mockTimeText: {
+    color: '#C85B66',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  mockPoolGrid: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 12,
+  },
+  mockPoolCard: {
+    flex: 1,
+    borderRadius: 12,
+    borderWidth: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 88,
+  },
+  mockPoolYes: {
+    borderColor: 'rgba(136, 103, 247, 0.34)',
+    backgroundColor: 'rgba(27, 30, 47, 0.7)',
+  },
+  mockPoolNo: {
+    borderColor: 'rgba(130, 56, 79, 0.45)',
+    backgroundColor: 'rgba(40, 24, 33, 0.7)',
+  },
+  mockPoolLabel: {
+    color: '#857FB0',
+    fontSize: 11,
+    fontWeight: '700',
+    marginBottom: 5,
+  },
+  mockPoolAmount: {
+    color: '#F9C74A',
+    fontSize: 26,
+    fontWeight: '800',
+    marginBottom: 4,
+  },
+  mockPoolUser: {
+    color: '#7E7B96',
+    fontSize: 12,
+  },
+  mockActionRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  mockVoteYesBtn: {
+    flex: 1,
+    borderRadius: 12,
+    backgroundColor: '#1E5544',
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  mockVoteYesBtnActive: {
+    borderWidth: 1,
+    borderColor: '#4BFE9E',
+  },
+  mockVoteNoBtn: {
+    flex: 1,
+    borderRadius: 12,
+    backgroundColor: '#5D2432',
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  mockVoteNoBtnActive: {
+    borderWidth: 1,
+    borderColor: '#FF545A',
+  },
+  mockVoteBtnDisabled: {
+    opacity: 0.7,
+  },
+  voteLiquidTrack: {
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: 'rgba(49, 54, 89, 0.75)',
+    overflow: 'hidden',
+    marginBottom: 12,
+  },
+  voteLiquidFill: {
+    height: '100%',
+    borderRadius: 999,
+  },
+  voteLiquidFillDefault: {
+    backgroundColor: '#4FAAF8',
+  },
+  voteLiquidFillYesGlow: {
+    backgroundColor: '#2AD67E',
+    shadowColor: '#2AD67E',
+    shadowOpacity: 0.8,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  voteLiquidFillNo: {
+    backgroundColor: '#8D4DFF',
+  },
+  voteOddsText: {
+    color: '#AFA8C8',
+    fontSize: 11,
+    marginBottom: 8,
+  },
+  mockVoteYesText: {
+    color: '#4BFE9E',
+    fontWeight: '800',
+    fontSize: 15,
+  },
+  mockVoteNoText: {
+    color: '#FF545A',
+    fontWeight: '800',
+    fontSize: 15,
+  },
+  mockVoteMeta: {
+    color: '#9F9AB8',
+    fontWeight: '600',
+  },
+  screenTitle: {
+    color: '#F0F0F6',
+    fontSize: 30,
+    fontWeight: '800',
+    marginBottom: 12,
+  },
+  screenSegment: {
+    backgroundColor: '#2A263C',
+    borderRadius: 14,
+    padding: 4,
+    flexDirection: 'row',
+    gap: 4,
+    marginBottom: 10,
+  },
+  screenSegmentBtn: {
+    flex: 1,
+    borderRadius: 10,
+    paddingVertical: 11,
+    alignItems: 'center',
+  },
+  screenSegmentBtnActive: {
+    backgroundColor: '#A447E0',
+  },
+  screenSegmentText: {
+    color: '#8A859B',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  screenSegmentTextActive: {
+    color: '#F4ECFF',
+  },
+  sectionRule: {
+    height: 1,
+    backgroundColor: 'rgba(105, 86, 147, 0.4)',
+    marginBottom: 12,
+  },
+  commitCard: {
+    backgroundColor: '#1C1730',
+    borderColor: 'rgba(141, 75, 255, 0.26)',
+    borderWidth: 1,
+    borderRadius: 18,
+    padding: 14,
+    marginBottom: 12,
+  },
+  commitOwnerName: {
+    color: '#F2F0F9',
+    fontWeight: '700',
+    fontSize: 18,
+  },
+  commitTypePill: {
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    backgroundColor: 'rgba(49, 75, 171, 0.25)',
+    borderWidth: 1,
+    borderColor: 'rgba(84, 120, 255, 0.45)',
+  },
+  commitTypePillText: {
+    color: '#3E6DDE',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+  },
+  commitTitle: {
+    color: '#F4F0FF',
+    fontSize: 17,
+    lineHeight: 24,
+    fontWeight: '700',
+    marginBottom: 12,
+  },
+  commitMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 12,
+  },
+  commitStatusPill: {
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  commitStatusActive: {
+    backgroundColor: 'rgba(30, 88, 63, 0.55)',
+  },
+  commitStatusSuccess: {
+    backgroundColor: 'rgba(23, 121, 91, 0.55)',
+  },
+  commitStatusExpired: {
+    backgroundColor: 'rgba(111, 34, 55, 0.55)',
+  },
+  commitStatusText: {
+    color: '#4DF69E',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  commitTimeText: {
+    marginLeft: 'auto',
+    color: '#C75F6A',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  commitPoolWrap: {
+    backgroundColor: '#262239',
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 12,
+  },
+  commitPoolTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  commitPoolBackers: {
+    color: '#8F8AA8',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  commitPoolTotal: {
+    color: '#F9C74A',
+    fontSize: 19,
+    fontWeight: '800',
+  },
+  commitPoolBar: {
+    height: 7,
+    borderRadius: 999,
+    backgroundColor: 'rgba(50, 58, 93, 0.75)',
+    overflow: 'hidden',
+    marginBottom: 8,
+  },
+  commitPoolBarFill: {
+    height: '100%',
+    backgroundColor: '#3CA5FF',
+    borderRadius: 999,
+  },
+  commitBackersList: {
+    flexDirection: 'row',
+    gap: 16,
+    flexWrap: 'wrap',
+  },
+  commitBackerItem: {
+    color: '#D2CEE3',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  commitCompleteBanner: {
+    borderRadius: 12,
+    backgroundColor: '#2ACB85',
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  commitCompleteText: {
+    color: '#E9FFF3',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  lbRangeRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 10,
+  },
+  lbRangeChip: {
+    borderRadius: 999,
+    backgroundColor: '#2A263B',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  lbRangeChipActive: {
+    backgroundColor: '#8F4EF2',
+  },
+  lbRangeText: {
+    color: '#8D87A6',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  lbRangeTextActive: {
+    color: '#F4ECFF',
+  },
+  lbCard: {
+    backgroundColor: '#1F1A33',
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(126, 72, 219, 0.25)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  lbLeftGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flex: 1,
+    minWidth: 0,
+  },
+  lbTextWrap: {
+    flex: 1,
+    minWidth: 0,
+  },
+  lbMedal: {
+    width: 26,
+    color: '#CFA157',
+    fontSize: 13,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  lbName: {
+    color: '#F2F0F8',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  lbSub: {
+    color: '#8D87A5',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  lbRightGroup: {
+    alignItems: 'flex-end',
+    marginLeft: 8,
+    minWidth: 74,
+  },
+  lbScore: {
+    color: '#F3ECFF',
+    fontSize: 20,
+    fontWeight: '800',
+  },
+  lbMetric: {
+    color: '#8E89A6',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  lbYourPosLabel: {
+    marginTop: 10,
+    marginBottom: 10,
+    color: '#7F7898',
+    fontWeight: '700',
+    fontSize: 12,
+    letterSpacing: 0.8,
+  },
+  lbSelfCard: {
+    backgroundColor: '#241942',
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(162, 83, 245, 0.45)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  lbSelfRank: {
+    width: 26,
+    color: '#A85AFF',
+    fontSize: 15,
+    fontWeight: '900',
+    textAlign: 'center',
+  },
+  profileHero: {
+    backgroundColor: '#27183F',
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 14,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(132, 84, 205, 0.32)',
+  },
+  profileTopRight: {
+    alignItems: 'flex-end',
+  },
+  profileGearBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileGearIcon: {
+    color: '#D8CFEF',
+    fontWeight: '800',
+    fontSize: 12,
+  },
+  profileAvatarLarge: {
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    backgroundColor: '#8B41E8',
+    alignSelf: 'center',
+    marginTop: 4,
+    marginBottom: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileAvatarLargeText: {
+    color: '#F2E8FF',
+    fontSize: 28,
+    fontWeight: '800',
+  },
+  profileName: {
+    color: '#F5F1FF',
+    fontSize: 24,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  profileHandle: {
+    color: '#9D93B8',
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 2,
+    marginBottom: 10,
+  },
+  profilePillRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 10,
+    marginBottom: 10,
+  },
+  profileMetricPill: {
+    backgroundColor: '#31294A',
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  profileMetricPillText: {
+    color: '#F4BC4B',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  profileBadgeRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 8,
+    flexWrap: 'wrap',
+  },
+  profileBadge: {
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: 'rgba(91, 54, 153, 0.45)',
+  },
+  profileBadgeText: {
+    color: '#9E73E8',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  profileStatsGrid: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 12,
+  },
+  profileStatCard: {
+    flex: 1,
+    backgroundColor: '#1F1B33',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(114, 72, 178, 0.25)',
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  profileStatValue: {
+    color: '#F2ECFF',
+    fontSize: 20,
+    fontWeight: '800',
+  },
+  profileStatLabel: {
+    color: '#9F93BB',
+    fontSize: 12,
+    marginTop: 4,
+  },
+  profileRoastCard: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(211, 131, 69, 0.45)',
+    backgroundColor: 'rgba(48, 34, 31, 0.45)',
+    padding: 14,
+    marginBottom: 12,
+  },
+  profileRoastTitle: {
+    color: '#F7F0FF',
+    fontSize: 18,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  profileRoastBody: {
+    color: '#ADA1C2',
+    fontSize: 14,
+    lineHeight: 20,
+    fontStyle: 'italic',
+  },
+  profileQuickRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 8,
+  },
+  profileAiBtn: {
+    marginTop: 10,
+    borderRadius: 10,
+    backgroundColor: '#2D2248',
+    borderWidth: 1,
+    borderColor: 'rgba(126,72,219,0.45)',
+    paddingVertical: 9,
+    alignItems: 'center',
+  },
+  profileAiBtnText: {
+    color: '#D9CCFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  profileAiRecapText: {
+    marginTop: 8,
+    color: '#C4B7DB',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  monetizeCard: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(126,72,219,0.35)',
+    backgroundColor: 'rgba(35, 28, 54, 0.78)',
+    padding: 10,
+    marginBottom: 10,
+  },
+  monetizeTitle: {
+    color: '#EDE8FF',
+    fontSize: 13,
+    fontWeight: '800',
+    marginBottom: 4,
+  },
+  monetizeMeta: {
+    color: '#BDB2D7',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  monetizeHint: {
+    color: '#9E93BC',
+    fontSize: 11,
+    lineHeight: 16,
+  },
+  referralCard: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(87, 136, 228, 0.35)',
+    backgroundColor: 'rgba(27, 37, 58, 0.65)',
+    padding: 10,
+    marginBottom: 10,
+  },
+  referralTitle: {
+    color: '#E5F0FF',
+    fontSize: 13,
+    fontWeight: '800',
+    marginBottom: 4,
+  },
+  referralMeta: {
+    color: '#AFC5E6',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  profileSectionTabs: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 10,
+  },
+  profileSectionTabBtn: {
+    flex: 1,
+    backgroundColor: '#2A263B',
+    borderRadius: 10,
+    alignItems: 'center',
+    paddingVertical: 9,
+  },
+  profileSectionTabBtnActive: {
+    backgroundColor: '#8F4EF2',
+  },
+  profileSectionTabText: {
+    color: '#A7A0C2',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  profileSectionTabTextActive: {
+    color: '#F2EFFF',
+  },
+  notificationCard: {
+    backgroundColor: '#1F1A33',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(126, 72, 219, 0.25)',
+  },
+  notificationTitle: {
+    color: '#EDE8FF',
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  notificationBody: {
+    color: '#A79FBE',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  createModalActions: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 10,
+  },
+  betTypeTabs: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 10,
+  },
+  betTypeTabBtn: {
+    flex: 1,
+    borderRadius: 10,
+    backgroundColor: '#2A263B',
+    paddingVertical: 9,
+    alignItems: 'center',
+  },
+  betTypeTabBtnActive: {
+    backgroundColor: '#8F4EF2',
+  },
+  betTypeTabText: {
+    color: '#A7A0C2',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  betTypeTabTextActive: {
+    color: '#F2EFFF',
+  },
+  aiPreviewCard: {
+    backgroundColor: 'rgba(38, 30, 57, 0.85)',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(126,72,219,0.35)',
+    padding: 10,
+    marginBottom: 10,
+  },
+  aiPreviewTitle: {
+    color: '#EEE7FF',
+    fontWeight: '800',
+    fontSize: 13,
+    marginBottom: 2,
+  },
+  aiPreviewMeta: {
+    color: '#A79FBE',
+    fontSize: 11,
+    marginBottom: 6,
+  },
+  aiPreviewText: {
+    color: '#D1C7E8',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  settingsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(139,92,246,0.22)',
+    paddingBottom: 8,
   },
   title: {
     fontSize: 34,
@@ -1984,9 +3752,35 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 12,
   },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  streakPill: {
+    borderWidth: 1,
+    borderColor: 'rgba(139, 92, 246, 0.35)',
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(139, 92, 246, 0.15)',
+  },
+  streakPillText: {
+    color: '#DDD6FE',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  bellBtn: {
+    backgroundColor: 'rgba(139, 92, 246, 0.35)',
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(139, 92, 246, 0.7)',
+  },
   card: {
-    backgroundColor: 'rgba(19, 19, 24, 0.65)',
-    borderColor: 'rgba(139, 92, 246, 0.28)',
+    backgroundColor: 'rgba(24, 24, 24, 0.68)',
+    borderColor: 'rgba(240, 240, 240, 0.1)',
     borderWidth: 1,
     borderRadius: 18,
     padding: 14,
@@ -2006,21 +3800,32 @@ const styles = StyleSheet.create({
   },
   myBetRow: {
     borderBottomWidth: 1,
-    borderBottomColor: '#1F4D1F',
+    borderBottomColor: 'rgba(139, 92, 246, 0.24)',
     paddingBottom: 8,
     marginBottom: 8,
   },
   requestRow: {
     borderBottomWidth: 1,
-    borderBottomColor: '#1F4D1F',
+    borderBottomColor: 'rgba(139, 92, 246, 0.24)',
     paddingBottom: 10,
     marginBottom: 10,
   },
+  lbHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 3,
+  },
+  lbRank: {
+    color: '#C4B5FD',
+    fontWeight: '800',
+    fontSize: 13,
+  },
   input: {
-    backgroundColor: 'rgba(8, 8, 12, 0.85)',
+    backgroundColor: 'rgba(8, 8, 8, 0.92)',
     borderWidth: 1,
-    borderColor: 'rgba(0, 255, 136, 0.35)',
-    color: '#F4F4FF',
+    borderColor: 'rgba(240, 240, 240, 0.18)',
+    color: '#F0F0F0',
     borderRadius: 14,
     padding: 12,
     marginBottom: 10,
@@ -2029,10 +3834,10 @@ const styles = StyleSheet.create({
     color: '#F4F4FF',
   },
   inputPlaceholder: {
-    color: '#7A7AA0',
+    color: '#7A7A7A',
   },
   primaryBtn: {
-    backgroundColor: '#2FAE5B',
+    backgroundColor: '#F0F0F0',
     borderRadius: 10,
     paddingVertical: 11,
     alignItems: 'center',
@@ -2041,14 +3846,14 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   activeBtn: {
-    backgroundColor: '#289A50',
+    backgroundColor: '#8B5CF6',
   },
   primaryBtnText: {
-    color: '#F8FAFF',
+    color: '#050505',
     fontWeight: '700',
   },
   dimText: {
-    color: '#8D8DA9',
+    color: '#9A9A9A',
     marginTop: 8,
   },
   errorText: {
@@ -2062,18 +3867,18 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     backgroundColor: 'rgba(13, 14, 19, 0.7)',
     borderWidth: 1,
-    borderColor: 'rgba(0, 255, 136, 0.28)',
+    borderColor: 'rgba(139, 92, 246, 0.35)',
   },
   betCard: {
     marginTop: 14,
     padding: 14,
     borderRadius: 18,
-    backgroundColor: 'rgba(14, 15, 20, 0.72)',
+    backgroundColor: 'rgba(20, 20, 20, 0.86)',
     borderWidth: 1,
     borderColor: 'rgba(139, 92, 246, 0.32)',
-    shadowColor: '#00FF88',
-    shadowOpacity: 0.16,
-    shadowRadius: 14,
+    shadowColor: '#6366F1',
+    shadowOpacity: 0.08,
+    shadowRadius: 12,
     shadowOffset: { width: 0, height: 8 },
     elevation: 6,
   },
@@ -2084,13 +3889,62 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   betTitle: {
-    color: '#F2F4FF',
+    color: '#F0F0F0',
     fontWeight: '800',
     fontSize: 18,
     marginBottom: 8,
   },
+  statusBadgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  liveScanBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(99, 102, 241, 0.45)',
+    backgroundColor: 'rgba(99, 102, 241, 0.16)',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  verifiedBadge: {
+    borderColor: 'rgba(240,240,240,0.45)',
+    backgroundColor: 'rgba(240,240,240,0.14)',
+  },
+  rejectedBadge: {
+    borderColor: 'rgba(139,92,246,0.6)',
+    backgroundColor: 'rgba(139,92,246,0.18)',
+  },
+  liveDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#6366F1',
+    marginRight: 6,
+  },
+  liveScanText: {
+    color: '#F0F0F0',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  timeBadge: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(240,240,240,0.26)',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: 'rgba(61,61,61,0.5)',
+  },
+  timeBadgeText: {
+    color: '#F0F0F0',
+    fontSize: 12,
+    fontWeight: '700',
+  },
   meta: {
-    color: '#A5A7C8',
+    color: '#B9B9B9',
     marginBottom: 4,
   },
   status: {
@@ -2110,19 +3964,19 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   smallBtn: {
-    backgroundColor: '#00C974',
+    backgroundColor: '#3D3D3D',
     borderRadius: 999,
     paddingVertical: 8,
     paddingHorizontal: 14,
   },
   smallBtnAlt: {
-    backgroundColor: '#3A254F',
+    backgroundColor: '#6366F1',
     borderRadius: 999,
     paddingVertical: 8,
     paddingHorizontal: 14,
   },
   smallBtnText: {
-    color: '#E8FFE8',
+    color: '#F0F0F0',
     fontWeight: '600',
   },
   proofWrap: {
@@ -2135,6 +3989,52 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     marginBottom: 8,
   },
+  scanWrap: {
+    position: 'relative',
+    overflow: 'hidden',
+    borderRadius: 14,
+    marginBottom: 8,
+  },
+  scanBar: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    height: 42,
+    backgroundColor: 'rgba(99,102,241,0.24)',
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(99,102,241,0.8)',
+  },
+  scanningText: {
+    position: 'absolute',
+    right: 8,
+    top: 8,
+    color: '#E6E7FF',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  holoSealPass: {
+    position: 'absolute',
+    bottom: 10,
+    right: 10,
+    color: '#F0F0F0',
+    fontWeight: '900',
+    fontSize: 16,
+    textShadowColor: '#6366F1',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 10,
+  },
+  holoSealFail: {
+    position: 'absolute',
+    bottom: 10,
+    right: 10,
+    color: '#C8A2FF',
+    fontWeight: '900',
+    fontSize: 16,
+    textShadowColor: '#8B5CF6',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 10,
+  },
   posterWrap: {
     marginBottom: 8,
   },
@@ -2144,7 +4044,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     marginBottom: 8,
     borderWidth: 1,
-    borderColor: '#2A6B2A',
+    borderColor: '#3D3D3D',
   },
   betLine: {
     color: '#A9D8A9',
@@ -2155,7 +4055,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 10,
     borderBottomWidth: 1,
-    borderBottomColor: '#1F4D1F',
+    borderBottomColor: 'rgba(139, 92, 246, 0.24)',
     paddingBottom: 8,
   },
   walletName: {
@@ -2173,7 +4073,7 @@ const styles = StyleSheet.create({
     marginTop: 10,
     paddingBottom: 10,
     borderBottomWidth: 1,
-    borderBottomColor: '#1F4D1F',
+    borderBottomColor: 'rgba(139, 92, 246, 0.24)',
   },
   rewardLabel: {
     color: '#EDEEFF',
@@ -2214,14 +4114,14 @@ const styles = StyleSheet.create({
   tagPill: {
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: 'rgba(0, 255, 136, 0.35)',
-    backgroundColor: 'rgba(0, 255, 136, 0.08)',
+    borderColor: 'rgba(240, 240, 240, 0.2)',
+    backgroundColor: 'rgba(61, 61, 61, 0.35)',
     paddingHorizontal: 10,
     paddingVertical: 5,
     marginTop: 4,
   },
   tagPillText: {
-    color: '#8FFFD0',
+    color: '#F0F0F0',
     fontSize: 12,
     fontWeight: '700',
   },
@@ -2234,12 +4134,21 @@ const styles = StyleSheet.create({
     width: 34,
     height: 34,
     borderRadius: 17,
-    backgroundColor: 'rgba(139, 92, 246, 0.35)',
+    backgroundColor: 'rgba(16, 16, 16, 0.92)',
     borderWidth: 1,
-    borderColor: 'rgba(139, 92, 246, 0.7)',
+    borderColor: 'rgba(240, 240, 240, 0.2)',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  ringWrap: {
+    width: 46,
+    height: 46,
     marginRight: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  ringSvg: {
+    position: 'absolute',
   },
   ownerBadgeText: {
     color: '#EDE9FF',
@@ -2262,8 +4171,18 @@ const styles = StyleSheet.create({
   poolTrack: {
     height: 10,
     borderRadius: 999,
-    backgroundColor: 'rgba(139, 92, 246, 0.2)',
+    backgroundColor: 'rgba(61, 61, 61, 0.8)',
     overflow: 'hidden',
+  },
+  poolLiquidFill: {
+    height: '100%',
+    borderRadius: 999,
+  },
+  poolLiquidYes: {
+    backgroundColor: '#F0F0F0',
+  },
+  poolLiquidNo: {
+    backgroundColor: '#6366F1',
   },
   poolYesFill: {
     height: '100%',
@@ -2321,21 +4240,21 @@ const styles = StyleSheet.create({
     fontSize: 10,
   },
   aiTerminal: {
-    backgroundColor: 'rgba(7, 12, 9, 0.78)',
+    backgroundColor: 'rgba(14, 14, 14, 0.86)',
     borderWidth: 1,
-    borderColor: 'rgba(0, 255, 136, 0.25)',
+    borderColor: 'rgba(61, 61, 61, 0.8)',
     borderRadius: 12,
     padding: 10,
     marginBottom: 8,
   },
   aiTerminalTitle: {
-    color: '#86F7BF',
+    color: '#C6C7D9',
     letterSpacing: 1,
     fontSize: 11,
     marginBottom: 6,
   },
   aiTerminalText: {
-    color: '#A7EFD0',
+    color: '#D7D7D7',
     marginTop: 4,
   },
   aiBookieBubble: {
@@ -2377,9 +4296,9 @@ const styles = StyleSheet.create({
     textShadowRadius: 8,
   },
   yesPillBtn: {
-    backgroundColor: 'rgba(0, 255, 136, 0.2)',
+    backgroundColor: 'rgba(240, 240, 240, 0.14)',
     borderWidth: 1,
-    borderColor: 'rgba(0, 255, 136, 0.7)',
+    borderColor: 'rgba(240, 240, 240, 0.7)',
     borderRadius: 999,
     paddingVertical: 8,
     paddingHorizontal: 16,
@@ -2391,6 +4310,12 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     paddingVertical: 8,
     paddingHorizontal: 16,
+  },
+  choiceActiveYes: {
+    backgroundColor: 'rgba(240,240,240,0.35)',
+  },
+  choiceActiveNo: {
+    backgroundColor: 'rgba(139,92,246,0.4)',
   },
   coinBurstRow: {
     flexDirection: 'row',
@@ -2418,7 +4343,103 @@ const styles = StyleSheet.create({
   soulboundText: {
     color: '#CCFFE9',
   },
+  sheetBackdrop: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  sheetBackdropTap: {
+    flex: 1,
+  },
+  sheetPanel: {
+    maxHeight: '70%',
+    backgroundColor: 'rgba(18,18,24,0.96)',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(139,92,246,0.5)',
+    padding: 16,
+  },
+  overlayProofGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 6,
+  },
+  overlayProofThumb: {
+    width: 80,
+    height: 80,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(99,102,241,0.55)',
+  },
+  statusRibbon: {
+    position: 'absolute',
+    right: 10,
+    top: 10,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: 'rgba(61,61,61,0.75)',
+    borderWidth: 1,
+    borderColor: 'rgba(240,240,240,0.15)',
+    zIndex: 3,
+  },
+  statusRibbonText: {
+    color: '#F0F0F0',
+    fontWeight: '700',
+    fontSize: 11,
+  },
+  dropzone: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: 'rgba(240,240,240,0.35)',
+    backgroundColor: 'rgba(255,255,255,0.03)',
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  dropzoneAlt: {
+    borderColor: 'rgba(99,102,241,0.55)',
+  },
+  dropzoneText: {
+    color: '#F0F0F0',
+    fontWeight: '600',
+  },
+  submitEvidenceBtn: {
+    borderRadius: 12,
+    backgroundColor: '#F0F0F0',
+    alignItems: 'center',
+    paddingVertical: 12,
+  },
+  neuralNodes: {
+    position: 'absolute',
+    left: 8,
+    bottom: 8,
+    flexDirection: 'row',
+    gap: 6,
+  },
+  node: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: '#6366F1',
+    shadowColor: '#6366F1',
+    shadowOpacity: 0.8,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  shutterOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(240,240,240,0.62)',
+  },
 });
+
+
+
+
+
 
 
 

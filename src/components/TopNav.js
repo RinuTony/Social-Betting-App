@@ -3,12 +3,11 @@ import { Text, View, StyleSheet, Pressable } from 'react-native';
 
 export default function TopNav({ current, onChange }) {
   const tabs = [
-    { key: 'Feed', icon: '◉' },
-    { key: 'My Bets', icon: '◎' },
-    { key: 'Social', icon: '◌' },
-    { key: 'Profiles', icon: '◍' },
-    { key: 'Wallet', icon: '◈' },
-    { key: 'Rewards', icon: '✦' },
+    { key: 'Home', icon: 'H', label: 'Home' },
+    { key: 'Commitments', icon: 'C', label: 'Commit' },
+    { key: 'Leaderboard', icon: 'L', label: 'Leaders' },
+    { key: 'Notifications', icon: 'N', label: 'Alerts' },
+    { key: 'Profile', icon: 'P', label: 'Profile' },
   ];
 
   return (
@@ -22,7 +21,7 @@ export default function TopNav({ current, onChange }) {
             style={[styles.tab, active && styles.activeTab]}
           >
             <Text style={[styles.icon, active && styles.activeIcon]}>{tab.icon}</Text>
-            <Text style={[styles.tabText, active && styles.activeTabText]}>{tab.key}</Text>
+            <Text style={[styles.tabText, active && styles.activeTabText]}>{tab.label}</Text>
           </Pressable>
         );
       })}
@@ -33,42 +32,41 @@ export default function TopNav({ current, onChange }) {
 const styles = StyleSheet.create({
   wrap: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    backgroundColor: 'rgba(18, 18, 22, 0.74)',
-    borderRadius: 20,
+    justifyContent: 'space-around',
+    backgroundColor: 'rgba(22, 18, 36, 0.94)',
+    borderRadius: 22,
     borderWidth: 1,
-    borderColor: 'rgba(139, 92, 246, 0.35)',
-    paddingHorizontal: 8,
-    paddingVertical: 8,
+    borderColor: 'rgba(139, 92, 246, 0.28)',
+    paddingHorizontal: 6,
+    paddingVertical: 6,
   },
   tab: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 14,
-    paddingVertical: 8,
+    paddingVertical: 7,
   },
   activeTab: {
-    backgroundColor: 'rgba(0, 255, 136, 0.14)',
+    backgroundColor: 'rgba(139, 92, 246, 0.2)',
     borderWidth: 1,
-    borderColor: 'rgba(0, 255, 136, 0.42)',
+    borderColor: 'rgba(139, 92, 246, 0.45)',
   },
   icon: {
-    color: '#7A7A90',
-    fontSize: 12,
+    color: '#8E87A6',
+    fontSize: 11,
     marginBottom: 2,
+    fontWeight: '700',
   },
   activeIcon: {
-    color: '#8B5CF6',
+    color: '#C5B8FF',
   },
   tabText: {
-    color: '#A3A3B7',
+    color: '#A7A0C2',
     fontWeight: '600',
     fontSize: 10,
   },
   activeTabText: {
-    color: '#00FF88',
+    color: '#F2EFFF',
   },
 });
-
-

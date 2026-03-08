@@ -2,6 +2,31 @@
 
 A social prediction platform where friends place virtual-coin bets on whether you'll do what you said you'll do.
 
+## App Store Style Pitch
+
+**Betme** turns self-improvement into a social game.  
+Post a commitment, let friends predict whether you will follow through, and prove it with AI-verified evidence.  
+Win trust, coins, and streaks when you deliver.
+
+### Why people keep using it
+- Instant core loop:
+  - Create commitment
+  - Friends vote YES/NO
+  - Submit proof, settle results, share wins
+- AI that adds real value:
+  - AI rewrites raw goals into clearer, verifiable commitments
+  - AI preview gives risk/odds + bookie-style commentary
+  - AI proof judge verifies completion evidence
+  - AI recap summarizes personal performance
+- Built-in monetization mechanics:
+  - Freemium AI credits for advanced AI tools
+  - Pro (demo flow) unlocks unlimited AI usage
+  - One-time AI credit packs purchasable with in-app coins
+- Shareability loops:
+  - Share invite links and profile snapshots
+  - Referral code rewards for both inviter and invitee
+  - Victory poster generation for screenshot-worthy outcomes
+
 ## MVP Features Implemented
 
 - Firebase email/password authentication (signup, login, logout).
@@ -20,7 +45,7 @@ A social prediction platform where friends place virtual-coin bets on whether yo
 - AI proof judge:
   - Optional proof image picker (`expo-image-picker`)
   - Gemini-based verdict (`PASS`/`FAIL`) + reason + confidence
-  - Automatic fallback to mock AI when Gemini key/model is not set or request fails
+  - Gemini-only verification (submission fails if Gemini is unavailable or returns invalid output)
 - Generative proof enhancement:
   - Turns proof photo into a shareable "MISSION ACCOMPLISHED" victory poster
   - Uses Gemini image generation with fallback to original proof photo
@@ -82,7 +107,7 @@ Required env vars:
 ## Firestore Collections
 
 - `users/{uid}`
-  - `uid`, `name`, `email`, `coins`, `createdAt`, `updatedAt`
+  - `uid`, `name`, `email`, `coins`, `plan`, `aiCredits`, `referralCode`, `referralCount`, `referredBy`, `createdAt`, `updatedAt`
 - `users/{uid}/friends/{friendId}`
   - `friendId`, `name`, `email`, `createdAt`, `createdAtMs`
 - `users/{uid}/incoming_requests/{fromUserId}`
